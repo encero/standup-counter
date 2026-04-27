@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: standup-db-pvc
+  namespace: standup-counter
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+  # Uncomment and set storageClassName if needed
+  # storageClassName: your-storage-class

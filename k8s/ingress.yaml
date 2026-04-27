@@ -1,0 +1,28 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: standup-counter
+  namespace: standup-counter
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
+    # Enable WebSocket support
+    traefik.ingress.kubernetes.io/service.sticky.cookie: "true"
+    traefik.ingress.kubernetes.io/service.sticky.cookie.name: standup-session
+spec:
+  ingressClassName: traefik
+  rules:
+    - host: standup.example.com  # Change to your domain
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: standup-counter
+                port:
+                  number: 80
+  # Uncomment for TLS
+  # tls:
+  #   - hosts:
+  #       - standup.example.com
+  #     secretName: standup-tls

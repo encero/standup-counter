@@ -1,0 +1,56 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: standup-counter
+  namespace: standup-counter
+  labels:
+    app: standup-counter
+spec:
+  replicas: 1  # Keep at 1 due to SQLite
+  selector:
+    matchLabels:
+      app: standup-counter
+  template:
+    metadata:
+      labels:
+        app: standup-counter
+    spec:
+      containers:
+        - name: standup-counter
+          image: standup-counter:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 3001
+              protocol: TCP
+          env:
+            - name: DB_PATH
+              value: /data/standup.db
+            - name: NODE_ENV
+              value: production
+          volumeMounts:
+            - name: db-storage
+              mountPath: /data
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            httpGet:
+              path: /api/members
+              port: 3001
+            initialDelaySeconds: 10
+            periodSeconds: 30
+          readinessProbe:
+            httpGet:
+              path: /api/members
+              port: 3001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: db-storage
+          persistentVolumeClaim:
+            claimName: standup-db-pvc
