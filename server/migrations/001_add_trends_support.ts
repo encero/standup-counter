@@ -19,9 +19,10 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Check for --dev-mode flag
 const isDevMode = process.argv.includes('--dev-mode');
-const dbPath = isDevMode 
+const defaultDbPath = isDevMode
   ? path.join(__dirname, '..', '..', 'standup-dev.db')
   : path.join(__dirname, '..', '..', 'standup.db');
+const dbPath = process.env.DB_PATH || defaultDbPath;
 
 console.log(`📦 Running migration on: ${dbPath}`);
 
