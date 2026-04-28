@@ -150,6 +150,18 @@ function runMigrations() {
     db.prepare("INSERT INTO _migrations (name) VALUES (?)").run('004_add_stock_symbols');
   }
 
+  // Migration 005: Add expected_seconds to teams
+  if (!appliedMigrations.has('005_add_expected_seconds')) {
+    console.log('📦 Running migration 005: Adding expected_seconds to teams...');
+
+    const columns = db.prepare("PRAGMA table_info(teams)").all() as { name: string }[];
+    if (!columns.some(c => c.name === 'expected_seconds')) {
+      db.exec(`ALTER TABLE teams ADD COLUMN expected_seconds INTEGER DEFAULT 90`);
+    }
+
+    db.prepare("INSERT INTO _migrations (name) VALUES (?)").run('005_add_expected_seconds');
+  }
+
   console.log('✅ Database migrations complete');
 }
 

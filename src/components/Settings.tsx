@@ -39,14 +39,29 @@ export function Settings({
   const [stockSymbols, setStockSymbols] = useState('');
   const [stockSymbolsSaved, setStockSymbolsSaved] = useState(false);
 
-  // Load stock symbols
+  // Load settings from server
   useEffect(() => {
     if (!teamId) return;
     fetch(`${API_BASE}/api/${teamId}/settings`)
       .then(r => r.json())
-      .then(data => setStockSymbols(data.stockSymbols || ''))
+      .then(data => {
+        setStockSymbols(data.stockSymbols || '');
+        if (data.expectedSeconds !== undefined) {
+          onExpectedSecondsChange(data.expectedSeconds);
+        }
+      })
       .catch(console.error);
-  }, [teamId]);
+  }, [teamId, onExpectedSecondsChange]);
+
+  // Save expected seconds when changed
+  const handleExpectedSecondsChange = (seconds: number) => {
+    onExpectedSecondsChange(seconds);
+    fetch(`${API_BASE}/api/${teamId}/settings`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expectedSeconds: seconds }),
+    }).catch(console.error);
+  };
 
   const handleSaveStockSymbols = () => {
     fetch(`${API_BASE}/api/${teamId}/settings`, {
@@ -92,7 +107,7 @@ export function Settings({
                   key={secs}
                   variant={expectedSeconds === secs ? 'default' : 'outline'}
                   size="sm"
-                  onClick={() => onExpectedSecondsChange(secs)}
+                  onClick={() => handleExpectedSecondsChange(secs)}
                 >
                   {secs < 60 ? `${secs}s` : `${secs / 60}m`}
                 </Button>
@@ -105,7 +120,7 @@ export function Settings({
                 max={300}
                 step={15}
                 value={expectedSeconds}
-                onChange={(e) => onExpectedSecondsChange(Number(e.target.value))}
+                onChange={(e) => handleExpectedSecondsChange(Number(e.target.value))}
                 className="flex-1"
               />
               <Input
@@ -113,7 +128,7 @@ export function Settings({
                 min={10}
                 max={600}
                 value={expectedSeconds}
-                onChange={(e) => onExpectedSecondsChange(Math.max(10, Number(e.target.value)))}
+                onChange={(e) => handleExpectedSecondsChange(Math.max(10, Number(e.target.value)))}
                 className="w-16 text-center text-sm"
               />
             </div>

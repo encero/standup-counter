@@ -478,17 +478,26 @@ teamRouter.get('/trends/members', (req, res) => {
   res.json({ members: membersAggregate, memberStats, sparklines: sparklineData, trends });
 });
 
-// Stock symbols endpoints
+// Team settings endpoints
 teamRouter.get('/settings', (req, res) => {
   const { teamId } = req.params;
-  const team = db.prepare('SELECT stock_symbols FROM teams WHERE id = ?').get(teamId) as { stock_symbols: string } | undefined;
-  res.json({ stockSymbols: team?.stock_symbols || '' });
+  const team = db.prepare('SELECT stock_symbols, expected_seconds FROM teams WHERE id = ?').get(teamId) as { stock_symbols: string; expected_seconds: number } | undefined;
+  res.json({
+    stockSymbols: team?.stock_symbols || '',
+    expectedSeconds: team?.expected_seconds ?? 90,
+  });
 });
 
 teamRouter.put('/settings', (req, res) => {
   const { teamId } = req.params;
-  const { stockSymbols } = req.body;
-  db.prepare('UPDATE teams SET stock_symbols = ? WHERE id = ?').run(stockSymbols || '', teamId);
+  const { stockSymbols, expectedSeconds } = req.body;
+
+  if (stockSymbols !== undefined) {
+    db.prepare('UPDATE teams SET stock_symbols = ? WHERE id = ?').run(stockSymbols || '', teamId);
+  }
+  if (expectedSeconds !== undefined) {
+    db.prepare('UPDATE teams SET expected_seconds = ? WHERE id = ?').run(expectedSeconds, teamId);
+  }
   res.json({ success: true });
 });
 
