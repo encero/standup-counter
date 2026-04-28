@@ -576,7 +576,7 @@ app.use('/api/:teamId', validateTeam, teamRouter);
 
 // SPA fallback - serve index.html for all non-API routes in production
 if (process.env.NODE_ENV === 'production') {
-  app.get('*path', (_req, res) => {
+  app.get('/{*path}', (_req, res) => {
     res.sendFile(path.join(__dirname, '..', 'dist', 'index.html'));
   });
 }
