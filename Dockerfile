@@ -39,6 +39,9 @@ COPY --from=builder /app/dist ./dist
 COPY server ./server
 COPY tsconfig.json ./
 
+# Copy scripts for CLI tools (team management, seeding, etc.)
+COPY scripts ./scripts
+
 # Install tsx for running TypeScript server
 RUN npm install -g tsx
 
