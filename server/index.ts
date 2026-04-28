@@ -169,6 +169,10 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'stop':
+          // Broadcast end_standup with the standupId before resetting
+          if (timerState.standupId) {
+            broadcastToTeam(teamId, { type: 'end_standup', standupId: timerState.standupId });
+          }
           timerState.currentSpeaker = null;
           timerState.standupId = null;
           timerState.status = 'idle';

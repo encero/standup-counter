@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
 import { BarChart2, History } from 'lucide-react';
 import { useStandup } from '@/context/StandupContext';
@@ -15,14 +15,23 @@ const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:3001';
 export function StandupTimer() {
   const {
     teamId, teamMembers, sessions, currentSpeaker, currentStandupId, status, elapsedTime, interruptions,
-    startTimer, pauseTimer, resumeTimer, stopTimer, addMember, removeMember,
-    clearSessions, formatTime,
+    endedStandupId, startTimer, pauseTimer, resumeTimer, stopTimer, addMember, removeMember,
+    clearSessions, clearEndedStandupId, formatTime,
   } = useStandup();
 
   const [expectedSeconds, setExpectedSeconds] = useState(90);
   const [showSummary, setShowSummary] = useState(false);
   const [summaryStandupId, setSummaryStandupId] = useState<string | null>(null);
   const expectedMs = expectedSeconds * 1000;
+
+  // Show summary when standup is ended (e.g., from control page)
+  useEffect(() => {
+    if (endedStandupId) {
+      setSummaryStandupId(endedStandupId);
+      setShowSummary(true);
+      clearEndedStandupId();
+    }
+  }, [endedStandupId, clearEndedStandupId]);
 
   const handleEndStandup = () => {
     // No-op if no one has spoken yet

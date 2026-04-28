@@ -42,6 +42,7 @@ export function useStandupTimer(teamId: string) {
   const [elapsedTime, setElapsedTime] = useState(0);
   const [interruptions, setInterruptions] = useState(0);
   const [currentStandupId, setCurrentStandupId] = useState<string | null>(null);
+  const [endedStandupId, setEndedStandupId] = useState<string | null>(null);
 
   const startTimeRef = useRef<number | null>(null);
   const pauseStartRef = useRef<number | null>(null);
@@ -79,6 +80,9 @@ export function useStandupTimer(teamId: string) {
             pauseStartRef.current = msg.pauseStart;
           } else if (msg.type === 'tick') {
             setElapsedTime(msg.elapsedTime);
+          } else if (msg.type === 'end_standup') {
+            // Standup was ended (possibly from control page) - trigger summary
+            setEndedStandupId(msg.standupId);
           }
         } catch (err) {
           console.error('WebSocket message error:', err);
@@ -228,11 +232,16 @@ export function useStandupTimer(teamId: string) {
     return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
   };
 
+  const clearEndedStandupId = useCallback(() => {
+    setEndedStandupId(null);
+  }, []);
+
   return {
     teamMembers,
     sessions,
     currentSpeaker,
     currentStandupId,
+    endedStandupId,
     status,
     elapsedTime,
     interruptions,
@@ -244,6 +253,7 @@ export function useStandupTimer(teamId: string) {
     addMember,
     removeMember,
     clearSessions,
+    clearEndedStandupId,
     formatTime,
   };
 }
