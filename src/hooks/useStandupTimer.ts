@@ -51,6 +51,72 @@ export function useStandupTimer(teamId: string) {
   const standupIdRef = useRef<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
+  // Refs for values needed in WebSocket handler to avoid stale closures
+  const currentSpeakerRef = useRef<TeamMember | null>(null);
+  const elapsedTimeRef = useRef(0);
+  const interruptionsRef = useRef(0);
+  const sessionsRef = useRef<SpeakerSession[]>([]);
+
+  // Keep refs in sync with state
+  useEffect(() => { currentSpeakerRef.current = currentSpeaker; }, [currentSpeaker]);
+  useEffect(() => { elapsedTimeRef.current = elapsedTime; }, [elapsedTime]);
+  useEffect(() => { interruptionsRef.current = interruptions; }, [interruptions]);
+  useEffect(() => { sessionsRef.current = sessions; }, [sessions]);
+
+  // Unified helper to save session for a speaker
+  const saveSession = useCallback((
+    speaker: TeamMember,
+    elapsed: number,
+    interruptionCount: number,
+    totalPaused: number,
+    standupId: string,
+    startTime: number
+  ) => {
+    if (elapsed <= 0) return;
+
+    const now = Date.now();
+    // Use ref-based lookup to avoid stale closure issues in WebSocket handler
+    const existingSession = sessionsRef.current.find(
+      s => s.memberId === speaker.id && s.standupId === standupId
+    );
+
+    if (existingSession) {
+      // Update existing session - accumulate time and interruptions
+      const updatedSession: SpeakerSession = {
+        ...existingSession,
+        endTime: now,
+        duration: existingSession.duration + elapsed,
+        interruptions: existingSession.interruptions + interruptionCount,
+        pausedDuration: existingSession.pausedDuration + totalPaused,
+      };
+      setSessions(prev => prev.map(s => s.id === existingSession.id ? updatedSession : s));
+      fetch(`${API_URL}/sessions/${existingSession.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedSession),
+      }).catch(err => console.error('Failed to update session:', err));
+    } else {
+      // Create new session
+      const session: SpeakerSession = {
+        id: crypto.randomUUID(),
+        memberId: speaker.id,
+        memberName: speaker.name,
+        standupId,
+        startTime,
+        endTime: now,
+        duration: elapsed,
+        interruptions: interruptionCount,
+        pausedDuration: totalPaused,
+      };
+      setSessions(prev => [...prev, session]);
+      fetch(`${API_URL}/sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(session),
+      }).catch(err => console.error('Failed to save session:', err));
+    }
+  }, [API_URL]);
+
   // WebSocket connection for syncing with control page
   useEffect(() => {
     if (!teamValid || !teamId) return;
@@ -69,6 +135,24 @@ export function useStandupTimer(teamId: string) {
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === 'state') {
+            const prevSpeaker = currentSpeakerRef.current;
+            const newSpeaker = msg.currentSpeaker;
+            const speakerChanged = prevSpeaker && newSpeaker && prevSpeaker.id !== newSpeaker.id;
+
+            // If speaker changed remotely (from control page), save previous speaker's session
+            if (speakerChanged && startTimeRef.current && standupIdRef.current) {
+              const prevElapsed = Date.now() - startTimeRef.current - totalPausedRef.current;
+              saveSession(
+                prevSpeaker,
+                prevElapsed,
+                interruptionsRef.current,
+                totalPausedRef.current,
+                standupIdRef.current,
+                startTimeRef.current
+              );
+            }
+
+            // Update all state
             setCurrentSpeaker(msg.currentSpeaker);
             setStatus(msg.status);
             setElapsedTime(msg.elapsedTime);
@@ -101,7 +185,7 @@ export function useStandupTimer(teamId: string) {
       clearTimeout(timeout);
       if (ws) ws.close();
     };
-  }, [teamId, WS_URL, teamValid]);
+  }, [teamId, WS_URL, teamValid, saveSession]);
 
   const wsSend = useCallback((data: object) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
@@ -126,52 +210,24 @@ export function useStandupTimer(teamId: string) {
     };
   }, [status, updateElapsed]);
 
+  // Wrapper that gathers current values from refs and calls saveSession
   const saveCurrentSession = useCallback(() => {
-    if (currentSpeaker && startTimeRef.current && elapsedTime > 0 && standupIdRef.current) {
-      const now = Date.now();
+    const speaker = currentSpeakerRef.current;
+    const startTime = startTimeRef.current;
+    const standupId = standupIdRef.current;
+    const elapsed = elapsedTimeRef.current;
 
-      // Check if this speaker already has a session in the CURRENT standup
-      const existingSession = sessions.find(
-        s => s.memberId === currentSpeaker.id && s.standupId === standupIdRef.current
+    if (speaker && startTime && elapsed > 0 && standupId) {
+      saveSession(
+        speaker,
+        elapsed,
+        interruptionsRef.current,
+        totalPausedRef.current,
+        standupId,
+        startTime
       );
-
-      if (existingSession) {
-        // Update existing session - accumulate time and interruptions
-        const updatedSession: SpeakerSession = {
-          ...existingSession,
-          endTime: now,
-          duration: existingSession.duration + elapsedTime,
-          interruptions: existingSession.interruptions + interruptions,
-          pausedDuration: existingSession.pausedDuration + totalPausedRef.current,
-        };
-        setSessions(prev => prev.map(s => s.id === existingSession.id ? updatedSession : s));
-        fetch(`${API_URL}/sessions/${existingSession.id}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(updatedSession),
-        }).catch(err => console.error('Failed to update session:', err));
-      } else {
-        // Create new session
-        const session: SpeakerSession = {
-          id: crypto.randomUUID(),
-          memberId: currentSpeaker.id,
-          memberName: currentSpeaker.name,
-          standupId: standupIdRef.current,
-          startTime: startTimeRef.current,
-          endTime: now,
-          duration: elapsedTime,
-          interruptions,
-          pausedDuration: totalPausedRef.current,
-        };
-        setSessions(prev => [...prev, session]);
-        fetch(`${API_URL}/sessions`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(session),
-        }).catch(err => console.error('Failed to save session:', err));
-      }
     }
-  }, [currentSpeaker, elapsedTime, interruptions, sessions]);
+  }, [saveSession]);
 
   const startTimer = useCallback((speaker: TeamMember) => {
     // If clicking the current speaker, do nothing
