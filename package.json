@@ -12,7 +12,10 @@
     "preview": "vite preview",
     "migrate": "tsx server/migrations/001_add_trends_support.ts",
     "seed": "tsx scripts/seed-fake-data.ts",
-    "team": "tsx scripts/team-cli.ts"
+    "team": "tsx scripts/team-cli.ts",
+    "test": "playwright test",
+    "test:ui": "playwright test --ui",
+    "test:headed": "playwright test --headed"
   },
   "dependencies": {
     "@base-ui/react": "1.4.1",
@@ -35,6 +38,7 @@
   },
   "devDependencies": {
     "@eslint/js": "10.0.1",
+    "@playwright/test": "^1.59.1",
     "@types/better-sqlite3": "7.6.13",
     "@types/cors": "2.8.19",
     "@types/express": "5.0.6",
@@ -48,6 +52,7 @@
     "eslint-plugin-react-hooks": "7.1.1",
     "eslint-plugin-react-refresh": "0.5.2",
     "globals": "17.5.0",
+    "playwright": "^1.59.1",
     "tsx": "4.21.0",
     "typescript": "6.0.2",
     "typescript-eslint": "8.58.2",
