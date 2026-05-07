@@ -47,9 +47,10 @@ export function useStandupTimer(teamId: string) {
   const startTimeRef = useRef<number | null>(null);
   const pauseStartRef = useRef<number | null>(null);
   const totalPausedRef = useRef(0);
-  const intervalRef = useRef<number | null>(null);
   const standupIdRef = useRef<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  // Track if we initiated a speaker change locally to avoid double-saving
+  const localSpeakerChangeRef = useRef(false);
 
   // Refs for values needed in WebSocket handler to avoid stale closures
   const currentSpeakerRef = useRef<TeamMember | null>(null);
@@ -140,7 +141,8 @@ export function useStandupTimer(teamId: string) {
             const speakerChanged = prevSpeaker && newSpeaker && prevSpeaker.id !== newSpeaker.id;
 
             // If speaker changed remotely (from control page), save previous speaker's session
-            if (speakerChanged && startTimeRef.current && standupIdRef.current) {
+            // Skip if we initiated this change locally (already saved in startTimer)
+            if (speakerChanged && startTimeRef.current && standupIdRef.current && !localSpeakerChangeRef.current) {
               const prevElapsed = Date.now() - startTimeRef.current - totalPausedRef.current;
               saveSession(
                 prevSpeaker,
@@ -151,6 +153,8 @@ export function useStandupTimer(teamId: string) {
                 startTimeRef.current
               );
             }
+            // Reset the local change flag after processing
+            localSpeakerChangeRef.current = false;
 
             // Update all state
             setCurrentSpeaker(msg.currentSpeaker);
@@ -193,22 +197,9 @@ export function useStandupTimer(teamId: string) {
     }
   }, []);
 
-  const updateElapsed = useCallback(() => {
-    if (startTimeRef.current && status === 'running') {
-      const now = Date.now();
-      const elapsed = now - startTimeRef.current - totalPausedRef.current;
-      setElapsedTime(Math.max(0, elapsed));
-    }
-  }, [status]);
-
-  useEffect(() => {
-    if (status === 'running') {
-      intervalRef.current = window.setInterval(updateElapsed, 100);
-    }
-    return () => {
-      if (intervalRef.current) clearInterval(intervalRef.current);
-    };
-  }, [status, updateElapsed]);
+  // Note: We rely on server 'tick' messages for elapsed time updates.
+  // No client-side interval needed - this avoids doubled timer updates
+  // when both client and server calculate elapsed time independently.
 
   // Wrapper that gathers current values from refs and calls saveSession
   const saveCurrentSession = useCallback(() => {
@@ -236,6 +227,8 @@ export function useStandupTimer(teamId: string) {
     }
     // If switching speakers while running, save current session first
     if (status !== 'idle' && currentSpeaker) {
+      // Mark as local change to prevent double-save when WebSocket state comes back
+      localSpeakerChangeRef.current = true;
       saveCurrentSession();
     }
     // Send to WebSocket server (server manages standupId)

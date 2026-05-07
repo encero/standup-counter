@@ -375,3 +375,93 @@ test.describe('Multi-Device Sync (UI)', () => {
     await context2.close();
   });
 });
+
+test.describe('Session Duration Regression', () => {
+  test('switching speakers does not double session duration', async ({ page }) => {
+    // Regression test for bug where switching speakers caused session duration to be saved twice
+    // First in startTimer() and again in WebSocket handler, resulting in doubled duration
+    const teamId = createTeamInDb('Duration Regression Team', ['Alice', 'Bob']);
+    await page.goto(`/${teamId}`);
+
+    // Wait for members to load and WebSocket to connect
+    await expect(page.getByText('Alice')).toBeVisible();
+    await page.waitForTimeout(500);
+
+    // Start timer for Alice
+    await page.getByRole('button', { name: /Alice/ }).click();
+    await expect(page.getByText('Alice is speaking')).toBeVisible({ timeout: 10000 });
+
+    // Wait for some time to accumulate (2 seconds)
+    await page.waitForTimeout(2000);
+
+    // Switch to Bob - this should save Alice's session ONCE
+    await page.getByRole('button', { name: /Bob/ }).click();
+    await expect(page.getByText('Bob is speaking')).toBeVisible({ timeout: 10000 });
+
+    // Wait a moment for session to be saved
+    await page.waitForTimeout(500);
+
+    // Check the session in the database
+    const db = new Database(TEST_DB_PATH);
+    const sessions = db.prepare(`
+      SELECT member_name, duration
+      FROM sessions
+      WHERE team_id = ? AND member_name = 'Alice'
+    `).all(teamId) as { member_name: string; duration: number }[];
+    db.close();
+
+    // There should be exactly one session for Alice
+    expect(sessions.length).toBe(1);
+
+    // Duration should be roughly 2 seconds (with some tolerance for timing)
+    // If doubled, it would be ~4 seconds
+    const aliceDuration = sessions[0].duration;
+    expect(aliceDuration).toBeGreaterThan(1500); // At least 1.5s
+    expect(aliceDuration).toBeLessThan(3500); // Less than 3.5s (definitely not doubled)
+  });
+
+  test('ending standup does not double final speaker duration', async ({ page }) => {
+    // Ensure ending standup doesn't cause similar doubling for the final speaker
+    const teamId = createTeamInDb('End Standup Regression Team', ['Charlie', 'Diana']);
+    await page.goto(`/${teamId}`);
+
+    // Wait for members to load
+    await expect(page.getByText('Charlie')).toBeVisible();
+    await page.waitForTimeout(500);
+
+    // Start timer for Charlie
+    await page.getByRole('button', { name: /Charlie/ }).click();
+    await expect(page.getByText('Charlie is speaking')).toBeVisible({ timeout: 10000 });
+
+    // Wait for some time
+    await page.waitForTimeout(2000);
+
+    // End the standup
+    await page.getByRole('button', { name: /End Standup/ }).click();
+
+    // Wait for the summary dialog and close it
+    await expect(page.getByText('Standup Complete')).toBeVisible({ timeout: 5000 });
+    // Close the dialog by pressing Escape or clicking outside
+    await page.keyboard.press('Escape');
+
+    // Wait a moment for session to be saved
+    await page.waitForTimeout(500);
+
+    // Check the session in the database
+    const db = new Database(TEST_DB_PATH);
+    const sessions = db.prepare(`
+      SELECT member_name, duration
+      FROM sessions
+      WHERE team_id = ? AND member_name = 'Charlie'
+    `).all(teamId) as { member_name: string; duration: number }[];
+    db.close();
+
+    // There should be exactly one session for Charlie
+    expect(sessions.length).toBe(1);
+
+    // Duration should be roughly 2 seconds, not doubled
+    const charlieDuration = sessions[0].duration;
+    expect(charlieDuration).toBeGreaterThan(1500);
+    expect(charlieDuration).toBeLessThan(3500);
+  });
+});
