@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { Link } from 'react-router-dom';
-import { BarChart2, History } from 'lucide-react';
+import { BarChart2, History, WifiOff, RefreshCw } from 'lucide-react';
 import { useStandup } from '@/context/StandupContext';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -9,15 +9,35 @@ import { MemberSelector } from '@/components/shared/MemberSelector';
 import { RadialIndicator } from '@/components/shared/TimeIndicator';
 import { Settings } from '@/components/Settings';
 import { StandupSummary } from '@/components/StandupSummary';
+import { cn } from '@/lib/utils';
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:3001';
 
 export function StandupTimer() {
   const {
     teamId, teamMembers, sessions, currentSpeaker, currentStandupId, status, elapsedTime, interruptions,
-    endedStandupId, startTimer, pauseTimer, resumeTimer, stopTimer, addMember, removeMember,
+    endedStandupId, connectionStatus, startTimer, pauseTimer, resumeTimer, stopTimer, addMember, removeMember,
     clearSessions, clearEndedStandupId, formatTime,
   } = useStandup();
+
+  // Show connection issues after a short delay to avoid flashing during initial connection
+  const [showConnectionStatus, setShowConnectionStatus] = useState(false);
+  useEffect(() => {
+    if (connectionStatus === 'connected') {
+      setShowConnectionStatus(false);
+    } else if (connectionStatus === 'disconnected' || connectionStatus === 'reconnecting') {
+      // Show immediately when disconnected/reconnecting
+      setShowConnectionStatus(true);
+    } else {
+      // For 'connecting', show after 2 seconds if still connecting
+      const timeout = setTimeout(() => {
+        if (connectionStatus === 'connecting') {
+          setShowConnectionStatus(true);
+        }
+      }, 2000);
+      return () => clearTimeout(timeout);
+    }
+  }, [connectionStatus]);
 
   const [expectedSeconds, setExpectedSeconds] = useState(90);
   const [showSummary, setShowSummary] = useState(false);
@@ -61,6 +81,37 @@ export function StandupTimer() {
 
   return (
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900 p-4 relative">
+      {/* Connection Status - Only shown when there's an issue */}
+      {showConnectionStatus && (
+        <div
+          className={cn(
+            "absolute top-4 left-4 z-10 flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium transition-all",
+            connectionStatus === 'disconnected' && "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-400",
+            connectionStatus === 'reconnecting' && "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400",
+            connectionStatus === 'connecting' && "bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-400"
+          )}
+        >
+          {connectionStatus === 'disconnected' && (
+            <>
+              <WifiOff className="h-4 w-4" />
+              <span>Disconnected</span>
+            </>
+          )}
+          {connectionStatus === 'reconnecting' && (
+            <>
+              <RefreshCw className="h-4 w-4 animate-spin" />
+              <span>Reconnecting...</span>
+            </>
+          )}
+          {connectionStatus === 'connecting' && (
+            <>
+              <RefreshCw className="h-4 w-4 animate-spin" />
+              <span>Connecting...</span>
+            </>
+          )}
+        </div>
+      )}
+
       {/* Top bar icons - Absolute positioned */}
       <div className="absolute top-4 right-4 z-10 flex items-center gap-2">
         <Button

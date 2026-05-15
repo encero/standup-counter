@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { WifiOff, RefreshCw, Wifi } from 'lucide-react';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
@@ -18,7 +19,7 @@ export function ControlPage() {
     status,
     elapsedTime,
     interruptions,
-    isConnected,
+    connectionStatus,
     startTimer,
     pauseTimer,
     resumeTimer,
@@ -59,14 +60,37 @@ export function ControlPage() {
     <div className="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900 p-4">
       <div className="max-w-md mx-auto space-y-4">
         {/* Connection Status */}
-        <div className="flex items-center justify-center gap-2 text-sm">
-          <div className={cn(
-            "w-2 h-2 rounded-full",
-            isConnected ? "bg-green-500" : "bg-red-500"
-          )} />
-          <span className="text-muted-foreground">
-            {isConnected ? 'Connected' : 'Disconnected'}
-          </span>
+        <div className={cn(
+          "flex items-center justify-center gap-2 text-sm px-3 py-1.5 rounded-full mx-auto w-fit",
+          connectionStatus === 'connected' && "bg-green-100 text-green-700 dark:bg-green-950 dark:text-green-400",
+          connectionStatus === 'disconnected' && "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-400",
+          connectionStatus === 'reconnecting' && "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400",
+          connectionStatus === 'connecting' && "bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-400"
+        )}>
+          {connectionStatus === 'connected' && (
+            <>
+              <Wifi className="h-4 w-4" />
+              <span>Connected</span>
+            </>
+          )}
+          {connectionStatus === 'disconnected' && (
+            <>
+              <WifiOff className="h-4 w-4" />
+              <span>Disconnected</span>
+            </>
+          )}
+          {connectionStatus === 'reconnecting' && (
+            <>
+              <RefreshCw className="h-4 w-4 animate-spin" />
+              <span>Reconnecting...</span>
+            </>
+          )}
+          {connectionStatus === 'connecting' && (
+            <>
+              <RefreshCw className="h-4 w-4 animate-spin" />
+              <span>Connecting...</span>
+            </>
+          )}
         </div>
 
         {/* Timer Display */}

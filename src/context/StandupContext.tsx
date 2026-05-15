@@ -1,6 +1,8 @@
 import { createContext, useContext, type ReactNode } from 'react';
 import { useParams } from 'react-router-dom';
-import { useStandupTimer } from '@/hooks/useStandupTimer';
+import { useStandupTimer, type ConnectionStatus } from '@/hooks/useStandupTimer';
+
+export type { ConnectionStatus };
 
 type StandupContextType = ReturnType<typeof useStandupTimer> & { teamId: string };
 

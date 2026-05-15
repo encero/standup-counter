@@ -7,6 +7,13 @@ const WS_BASE = import.meta.env.PROD
   ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
   : 'ws://localhost:3001';
 
+// Reconnection configuration
+const INITIAL_RECONNECT_DELAY = 1000; // 1 second
+const MAX_RECONNECT_DELAY = 30000; // 30 seconds
+const RECONNECT_BACKOFF_MULTIPLIER = 2;
+
+export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'reconnecting';
+
 export function useStandupTimer(teamId: string) {
   const navigate = useNavigate();
   const [teamMembers, setTeamMembers] = useState<TeamMember[]>([]);
@@ -43,12 +50,15 @@ export function useStandupTimer(teamId: string) {
   const [interruptions, setInterruptions] = useState(0);
   const [currentStandupId, setCurrentStandupId] = useState<string | null>(null);
   const [endedStandupId, setEndedStandupId] = useState<string | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting');
 
   const startTimeRef = useRef<number | null>(null);
   const pauseStartRef = useRef<number | null>(null);
   const totalPausedRef = useRef(0);
   const standupIdRef = useRef<string | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const reconnectDelayRef = useRef(INITIAL_RECONNECT_DELAY);
   // Track if we initiated a speaker change locally to avoid double-saving
   const localSpeakerChangeRef = useRef(false);
 
@@ -122,17 +132,31 @@ export function useStandupTimer(teamId: string) {
   useEffect(() => {
     if (!teamValid || !teamId) return;
 
-    let ws: WebSocket | null = null;
     let isCancelled = false;
+    let initialTimeout: ReturnType<typeof setTimeout> | null = null;
 
-    // Small delay to avoid race conditions during React strict mode / fast refresh
-    const timeout = setTimeout(() => {
+    const connect = () => {
       if (isCancelled) return;
 
-      ws = new WebSocket(WS_URL);
+      // Clean up existing connection
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
+
+      setConnectionStatus(reconnectDelayRef.current > INITIAL_RECONNECT_DELAY ? 'reconnecting' : 'connecting');
+      const ws = new WebSocket(WS_URL);
       wsRef.current = ws;
 
+      ws.onopen = () => {
+        if (isCancelled) return;
+        console.log('WebSocket connected');
+        setConnectionStatus('connected');
+        // Reset reconnect delay on successful connection
+        reconnectDelayRef.current = INITIAL_RECONNECT_DELAY;
+      };
+
       ws.onmessage = (event) => {
+        if (isCancelled) return;
         try {
           const msg = JSON.parse(event.data);
           if (msg.type === 'state') {
@@ -177,17 +201,41 @@ export function useStandupTimer(teamId: string) {
         }
       };
 
+      ws.onclose = () => {
+        if (isCancelled) return;
+        console.log('WebSocket disconnected');
+        setConnectionStatus('disconnected');
+
+        // Schedule reconnection with exponential backoff
+        const delay = reconnectDelayRef.current;
+        console.log(`Reconnecting in ${delay}ms...`);
+        reconnectTimeoutRef.current = setTimeout(() => {
+          if (!isCancelled) {
+            reconnectDelayRef.current = Math.min(
+              reconnectDelayRef.current * RECONNECT_BACKOFF_MULTIPLIER,
+              MAX_RECONNECT_DELAY
+            );
+            connect();
+          }
+        }, delay);
+      };
+
       ws.onerror = () => {
         if (!isCancelled) {
           console.error('WebSocket error - team may not exist');
         }
+        // onclose will be called after onerror, triggering reconnection
       };
-    }, 100);
+    };
+
+    // Small delay to avoid race conditions during React strict mode / fast refresh
+    initialTimeout = setTimeout(connect, 100);
 
     return () => {
       isCancelled = true;
-      clearTimeout(timeout);
-      if (ws) ws.close();
+      if (initialTimeout) clearTimeout(initialTimeout);
+      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+      if (wsRef.current) wsRef.current.close();
     };
   }, [teamId, WS_URL, teamValid, saveSession]);
 
@@ -295,6 +343,7 @@ export function useStandupTimer(teamId: string) {
     elapsedTime,
     interruptions,
     isLoading,
+    connectionStatus,
     startTimer,
     pauseTimer,
     resumeTimer,
