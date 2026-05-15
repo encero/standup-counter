@@ -1,18 +1,9 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { ConnectionManager, type ConnectionStatus } from '@/lib/ConnectionManager';
 import type { TeamMember, SpeakerSession, TimerStatus } from '@/types/standup';
 
-const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:3001';
-const WS_BASE = import.meta.env.PROD
-  ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
-  : 'ws://localhost:3001';
-
-// Reconnection configuration
-const INITIAL_RECONNECT_DELAY = 1000; // 1 second
-const MAX_RECONNECT_DELAY = 30000; // 30 seconds
-const RECONNECT_BACKOFF_MULTIPLIER = 2;
-
-export type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'reconnecting';
+export type { ConnectionStatus };
 
 export function useStandupTimer(teamId: string) {
   const navigate = useNavigate();
@@ -21,17 +12,16 @@ export function useStandupTimer(teamId: string) {
   const [isLoading, setIsLoading] = useState(true);
   const [teamValid, setTeamValid] = useState(true);
 
-  const API_URL = `${API_BASE}/api/${teamId}`;
-  const WS_URL = `${WS_BASE}/ws/${teamId}`;
+  const API_URL = `/api/${teamId}`;
 
-  // Load initial data from SQLite
+  // Load initial data from SQLite via ConnectionManager
   useEffect(() => {
     Promise.all([
-      fetch(`${API_URL}/members`).then(r => {
-        if (r.status === 404) throw new Error('Team not found');
-        return r.json();
+      ConnectionManager.get<TeamMember[]>(`${API_URL}/members`).catch((err: Error & { status?: number }) => {
+        if (err.status === 404) throw new Error('Team not found');
+        throw err;
       }),
-      fetch(`${API_URL}/sessions`).then(r => r.json()),
+      ConnectionManager.get<SpeakerSession[]>(`${API_URL}/sessions`),
     ]).then(([members, sessions]) => {
       setTeamMembers(members);
       setSessions(sessions);
@@ -56,9 +46,6 @@ export function useStandupTimer(teamId: string) {
   const pauseStartRef = useRef<number | null>(null);
   const totalPausedRef = useRef(0);
   const standupIdRef = useRef<string | null>(null);
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reconnectDelayRef = useRef(INITIAL_RECONNECT_DELAY);
   // Track if we initiated a speaker change locally to avoid double-saving
   const localSpeakerChangeRef = useRef(false);
 
@@ -101,11 +88,8 @@ export function useStandupTimer(teamId: string) {
         pausedDuration: existingSession.pausedDuration + totalPaused,
       };
       setSessions(prev => prev.map(s => s.id === existingSession.id ? updatedSession : s));
-      fetch(`${API_URL}/sessions/${existingSession.id}`, {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(updatedSession),
-      }).catch(err => console.error('Failed to update session:', err));
+      ConnectionManager.put(`${API_URL}/sessions/${existingSession.id}`, updatedSession)
+        .catch(err => console.error('Failed to update session:', err));
     } else {
       // Create new session
       const session: SpeakerSession = {
@@ -120,129 +104,73 @@ export function useStandupTimer(teamId: string) {
         pausedDuration: totalPaused,
       };
       setSessions(prev => [...prev, session]);
-      fetch(`${API_URL}/sessions`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(session),
-      }).catch(err => console.error('Failed to save session:', err));
+      ConnectionManager.post(`${API_URL}/sessions`, session)
+        .catch(err => console.error('Failed to save session:', err));
     }
   }, [API_URL]);
 
-  // WebSocket connection for syncing with control page
+  // WebSocket connection for syncing with control page via ConnectionManager
   useEffect(() => {
     if (!teamValid || !teamId) return;
 
-    let isCancelled = false;
-    let initialTimeout: ReturnType<typeof setTimeout> | null = null;
+    // Connect via ConnectionManager (handles heartbeats, reconnection, visibility changes)
+    ConnectionManager.connect(teamId);
 
-    const connect = () => {
-      if (isCancelled) return;
+    // Subscribe to status updates
+    const unsubscribeStatus = ConnectionManager.onStatus(setConnectionStatus);
 
-      // Clean up existing connection
-      if (wsRef.current) {
-        wsRef.current.close();
+    // Subscribe to messages
+    const unsubscribeMessage = ConnectionManager.onMessage((data) => {
+      const msg = data as { type: string; [key: string]: unknown };
+
+      if (msg.type === 'state') {
+        const prevSpeaker = currentSpeakerRef.current;
+        const newSpeaker = msg.currentSpeaker as TeamMember | null;
+        const speakerChanged = prevSpeaker && newSpeaker && prevSpeaker.id !== newSpeaker.id;
+
+        // If speaker changed remotely (from control page), save previous speaker's session
+        // Skip if we initiated this change locally (already saved in startTimer)
+        if (speakerChanged && startTimeRef.current && standupIdRef.current && !localSpeakerChangeRef.current) {
+          const prevElapsed = Date.now() - startTimeRef.current - totalPausedRef.current;
+          saveSession(
+            prevSpeaker,
+            prevElapsed,
+            interruptionsRef.current,
+            totalPausedRef.current,
+            standupIdRef.current,
+            startTimeRef.current
+          );
+        }
+        // Reset the local change flag after processing
+        localSpeakerChangeRef.current = false;
+
+        // Update all state
+        setCurrentSpeaker(newSpeaker);
+        setStatus(msg.status as TimerStatus);
+        setElapsedTime(msg.elapsedTime as number);
+        setInterruptions(msg.interruptions as number);
+        standupIdRef.current = msg.standupId as string | null;
+        setCurrentStandupId(msg.standupId as string | null);
+        startTimeRef.current = msg.startTime as number | null;
+        totalPausedRef.current = msg.totalPaused as number;
+        pauseStartRef.current = msg.pauseStart as number | null;
+      } else if (msg.type === 'tick') {
+        setElapsedTime(msg.elapsedTime as number);
+      } else if (msg.type === 'end_standup') {
+        // Standup was ended (possibly from control page) - trigger summary
+        setEndedStandupId(msg.standupId as string);
       }
-
-      setConnectionStatus(reconnectDelayRef.current > INITIAL_RECONNECT_DELAY ? 'reconnecting' : 'connecting');
-      const ws = new WebSocket(WS_URL);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        if (isCancelled) return;
-        console.log('WebSocket connected');
-        setConnectionStatus('connected');
-        // Reset reconnect delay on successful connection
-        reconnectDelayRef.current = INITIAL_RECONNECT_DELAY;
-      };
-
-      ws.onmessage = (event) => {
-        if (isCancelled) return;
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === 'state') {
-            const prevSpeaker = currentSpeakerRef.current;
-            const newSpeaker = msg.currentSpeaker;
-            const speakerChanged = prevSpeaker && newSpeaker && prevSpeaker.id !== newSpeaker.id;
-
-            // If speaker changed remotely (from control page), save previous speaker's session
-            // Skip if we initiated this change locally (already saved in startTimer)
-            if (speakerChanged && startTimeRef.current && standupIdRef.current && !localSpeakerChangeRef.current) {
-              const prevElapsed = Date.now() - startTimeRef.current - totalPausedRef.current;
-              saveSession(
-                prevSpeaker,
-                prevElapsed,
-                interruptionsRef.current,
-                totalPausedRef.current,
-                standupIdRef.current,
-                startTimeRef.current
-              );
-            }
-            // Reset the local change flag after processing
-            localSpeakerChangeRef.current = false;
-
-            // Update all state
-            setCurrentSpeaker(msg.currentSpeaker);
-            setStatus(msg.status);
-            setElapsedTime(msg.elapsedTime);
-            setInterruptions(msg.interruptions);
-            standupIdRef.current = msg.standupId;
-            setCurrentStandupId(msg.standupId);
-            startTimeRef.current = msg.startTime;
-            totalPausedRef.current = msg.totalPaused;
-            pauseStartRef.current = msg.pauseStart;
-          } else if (msg.type === 'tick') {
-            setElapsedTime(msg.elapsedTime);
-          } else if (msg.type === 'end_standup') {
-            // Standup was ended (possibly from control page) - trigger summary
-            setEndedStandupId(msg.standupId);
-          }
-        } catch (err) {
-          console.error('WebSocket message error:', err);
-        }
-      };
-
-      ws.onclose = () => {
-        if (isCancelled) return;
-        console.log('WebSocket disconnected');
-        setConnectionStatus('disconnected');
-
-        // Schedule reconnection with exponential backoff
-        const delay = reconnectDelayRef.current;
-        console.log(`Reconnecting in ${delay}ms...`);
-        reconnectTimeoutRef.current = setTimeout(() => {
-          if (!isCancelled) {
-            reconnectDelayRef.current = Math.min(
-              reconnectDelayRef.current * RECONNECT_BACKOFF_MULTIPLIER,
-              MAX_RECONNECT_DELAY
-            );
-            connect();
-          }
-        }, delay);
-      };
-
-      ws.onerror = () => {
-        if (!isCancelled) {
-          console.error('WebSocket error - team may not exist');
-        }
-        // onclose will be called after onerror, triggering reconnection
-      };
-    };
-
-    // Small delay to avoid race conditions during React strict mode / fast refresh
-    initialTimeout = setTimeout(connect, 100);
+    });
 
     return () => {
-      isCancelled = true;
-      if (initialTimeout) clearTimeout(initialTimeout);
-      if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
-      if (wsRef.current) wsRef.current.close();
+      unsubscribeStatus();
+      unsubscribeMessage();
+      // Note: Don't disconnect here - other components may be using the connection
     };
-  }, [teamId, WS_URL, teamValid, saveSession]);
+  }, [teamId, teamValid, saveSession]);
 
   const wsSend = useCallback((data: object) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(data));
-    }
+    ConnectionManager.send(data);
   }, []);
 
   // Note: We rely on server 'tick' messages for elapsed time updates.
@@ -299,28 +227,25 @@ export function useStandupTimer(teamId: string) {
   const addMember = useCallback((name: string, isGuest = false) => {
     const newMember: TeamMember = { id: crypto.randomUUID(), name, isGuest };
     setTeamMembers(prev => [...prev, newMember]);
-    // Save to SQLite
-    fetch(`${API_URL}/members`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(newMember),
-    }).catch(err => console.error('Failed to save member:', err));
+    // Save to SQLite via ConnectionManager
+    ConnectionManager.post(`${API_URL}/members`, newMember)
+      .catch(err => console.error('Failed to save member:', err));
     return newMember;
-  }, []);
+  }, [API_URL]);
 
   const removeMember = useCallback((id: string) => {
     setTeamMembers(prev => prev.filter(m => m.id !== id));
-    // Delete from SQLite
-    fetch(`${API_URL}/members/${id}`, { method: 'DELETE' })
+    // Delete from SQLite via ConnectionManager
+    ConnectionManager.delete(`${API_URL}/members/${id}`)
       .catch(err => console.error('Failed to delete member:', err));
-  }, []);
+  }, [API_URL]);
 
   const clearSessions = useCallback(() => {
     setSessions([]);
-    // Clear from SQLite
-    fetch(`${API_URL}/sessions`, { method: 'DELETE' })
+    // Clear from SQLite via ConnectionManager
+    ConnectionManager.delete(`${API_URL}/sessions`)
       .catch(err => console.error('Failed to clear sessions:', err));
-  }, []);
+  }, [API_URL]);
 
   const formatTime = (ms: number) => {
     const totalSeconds = Math.floor(ms / 1000);

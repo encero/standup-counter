@@ -10,9 +10,8 @@ import {
   DialogTrigger,
   DialogDescription,
 } from '@/components/ui/dialog';
+import { ConnectionManager } from '@/lib/ConnectionManager';
 import type { TeamMember } from '@/types/standup';
-
-const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:3001';
 
 interface SettingsProps {
   teamId: string;
@@ -39,11 +38,10 @@ export function Settings({
   const [stockSymbols, setStockSymbols] = useState('');
   const [stockSymbolsSaved, setStockSymbolsSaved] = useState(false);
 
-  // Load settings from server
+  // Load settings from server via ConnectionManager
   useEffect(() => {
     if (!teamId) return;
-    fetch(`${API_BASE}/api/${teamId}/settings`)
-      .then(r => r.json())
+    ConnectionManager.get<{ stockSymbols?: string; expectedSeconds?: number }>(`/api/${teamId}/settings`)
       .then(data => {
         setStockSymbols(data.stockSymbols || '');
         if (data.expectedSeconds !== undefined) {
@@ -56,22 +54,16 @@ export function Settings({
   // Save expected seconds when changed
   const handleExpectedSecondsChange = (seconds: number) => {
     onExpectedSecondsChange(seconds);
-    fetch(`${API_BASE}/api/${teamId}/settings`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ expectedSeconds: seconds }),
-    }).catch(console.error);
+    ConnectionManager.put(`/api/${teamId}/settings`, { expectedSeconds: seconds })
+      .catch(console.error);
   };
 
   const handleSaveStockSymbols = () => {
-    fetch(`${API_BASE}/api/${teamId}/settings`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ stockSymbols }),
-    }).then(() => {
-      setStockSymbolsSaved(true);
-      setTimeout(() => setStockSymbolsSaved(false), 2000);
-    });
+    ConnectionManager.put(`/api/${teamId}/settings`, { stockSymbols })
+      .then(() => {
+        setStockSymbolsSaved(true);
+        setTimeout(() => setStockSymbolsSaved(false), 2000);
+      });
   };
 
   const handleAddMember = () => {

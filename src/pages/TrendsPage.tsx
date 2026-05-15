@@ -3,9 +3,8 @@ import { Link, useParams, useNavigate } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Sparkline, TrendArrow } from '@/components/shared/Sparkline';
+import { ConnectionManager } from '@/lib/ConnectionManager';
 import { cn } from '@/lib/utils';
-
-const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:3001';
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
 const WEEKDAYS = [1, 2, 3, 4, 5]; // Mon-Fri (0=Sun, 6=Sat)
 
@@ -44,24 +43,23 @@ export function TrendsPage() {
   const [memberTrends, setMemberTrends] = useState<MemberTrends | null>(null);
   const [standups, setStandups] = useState<Standup[]>([]);
 
-  const API_URL = `${API_BASE}/api/${teamId}`;
+  const API_URL = `/api/${teamId}`;
 
   useEffect(() => {
     if (!teamId) return;
     Promise.all([
-      fetch(`${API_URL}/trends/team?days=${days}`).then(r => {
-        if (r.status === 404) throw new Error('Team not found');
-        return r.json();
-      }),
-      fetch(`${API_URL}/trends/members?days=${days}`).then(r => r.json()),
-      fetch(`${API_URL}/trends/standups?days=${days}`).then(r => r.json()),
+      ConnectionManager.get<TeamTrends>(`${API_URL}/trends/team?days=${days}`),
+      ConnectionManager.get<MemberTrends>(`${API_URL}/trends/members?days=${days}`),
+      ConnectionManager.get<Standup[]>(`${API_URL}/trends/standups?days=${days}`),
     ]).then(([team, members, standupList]) => {
       setTeamTrends(team);
       setMemberTrends(members);
       setStandups(standupList);
-    }).catch(err => {
+    }).catch((err: Error & { status?: number }) => {
       console.error(err);
-      navigate('/team-not-found');
+      if (err.status === 404) {
+        navigate('/team-not-found');
+      }
     });
   }, [days, teamId, API_URL, navigate]);
 

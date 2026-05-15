@@ -4,10 +4,9 @@ import { WifiOff, RefreshCw, Wifi } from 'lucide-react';
 import { useWebSocket } from '@/hooks/useWebSocket';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent } from '@/components/ui/card';
+import { ConnectionManager } from '@/lib/ConnectionManager';
 import type { TeamMember } from '@/types/standup';
 import { cn } from '@/lib/utils';
-
-const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:3001';
 
 export function ControlPage() {
   const { teamId } = useParams<{ teamId: string }>();
@@ -31,16 +30,15 @@ export function ControlPage() {
 
   useEffect(() => {
     if (!teamId) return;
-    fetch(`${API_BASE}/api/${teamId}/members`)
-      .then(r => {
-        if (r.status === 404) {
-          navigate('/team-not-found');
-          return [];
-        }
-        return r.json();
-      })
+    ConnectionManager.get<TeamMember[]>(`/api/${teamId}/members`)
       .then(setMembers)
-      .catch(console.error);
+      .catch((err: Error & { status?: number }) => {
+        if (err.status === 404) {
+          navigate('/team-not-found');
+        } else {
+          console.error(err);
+        }
+      });
   }, [teamId, navigate]);
 
   const handleTogglePause = () => {

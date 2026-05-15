@@ -187,6 +187,11 @@ wss.on('connection', (ws, req) => {
         case 'getState':
           ws.send(JSON.stringify({ type: 'state', ...timerState }));
           break;
+
+        case 'ping':
+          // Heartbeat ping - respond immediately with pong
+          ws.send(JSON.stringify({ type: 'pong' }));
+          break;
       }
     } catch (err) {
       console.error('WebSocket message error:', err);

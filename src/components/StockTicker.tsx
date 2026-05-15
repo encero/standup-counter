@@ -1,7 +1,6 @@
 import { useState, useEffect } from 'react';
 import { cn } from '@/lib/utils';
-
-const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:3001';
+import { ConnectionManager } from '@/lib/ConnectionManager';
 
 interface StockQuote {
   symbol: string;
@@ -59,8 +58,7 @@ export function StockTicker({ teamId, className }: StockTickerProps) {
     if (!teamId) return;
 
     const fetchQuotes = () => {
-      fetch(`${API_BASE}/api/${teamId}/stocks`)
-        .then(r => r.json())
+      ConnectionManager.get<{ quotes?: StockQuote[] }>(`/api/${teamId}/stocks`)
         .then(data => {
           setQuotes(data.quotes || []);
           setLoading(false);

@@ -1,14 +1,6 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { useState, useEffect, useCallback } from 'react';
+import { ConnectionManager, type ConnectionStatus } from '@/lib/ConnectionManager';
 import type { TeamMember, TimerStatus } from '@/types/standup';
-
-const WS_BASE = import.meta.env.PROD
-  ? `${window.location.protocol === 'https:' ? 'wss:' : 'ws:'}//${window.location.host}`
-  : 'ws://localhost:3001';
-
-// Reconnection configuration
-const INITIAL_RECONNECT_DELAY = 1000; // 1 second
-const MAX_RECONNECT_DELAY = 30000; // 30 seconds
-const RECONNECT_BACKOFF_MULTIPLIER = 2;
 
 interface TimerState {
   currentSpeaker: TeamMember | null;
@@ -18,7 +10,21 @@ interface TimerState {
   interruptions: number;
 }
 
-type ConnectionStatus = 'connecting' | 'connected' | 'disconnected' | 'reconnecting';
+interface StateMessage {
+  type: 'state';
+  currentSpeaker: TeamMember | null;
+  standupId: string | null;
+  status: TimerStatus;
+  elapsedTime: number;
+  interruptions: number;
+}
+
+interface TickMessage {
+  type: 'tick';
+  elapsedTime: number;
+}
+
+type WebSocketMessage = StateMessage | TickMessage | { type: string };
 
 export function useWebSocket(teamId: string) {
   const [state, setState] = useState<TimerState>({
@@ -29,100 +35,44 @@ export function useWebSocket(teamId: string) {
     interruptions: 0,
   });
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting');
-  const [isConnected, setIsConnected] = useState(false);
-  const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const reconnectDelayRef = useRef(INITIAL_RECONNECT_DELAY);
-  const isMountedRef = useRef(true);
+  const isConnected = connectionStatus === 'connected';
 
   useEffect(() => {
-    isMountedRef.current = true;
     if (!teamId) return;
 
-    const connect = () => {
-      if (!isMountedRef.current) return;
+    // Connect via ConnectionManager
+    ConnectionManager.connect(teamId);
 
-      // Clean up existing connection
-      if (wsRef.current) {
-        wsRef.current.close();
+    // Subscribe to status updates
+    const unsubscribeStatus = ConnectionManager.onStatus(setConnectionStatus);
+
+    // Subscribe to messages
+    const unsubscribeMessage = ConnectionManager.onMessage((data) => {
+      const msg = data as WebSocketMessage;
+      if (msg.type === 'state') {
+        const stateMsg = msg as StateMessage;
+        setState({
+          currentSpeaker: stateMsg.currentSpeaker,
+          standupId: stateMsg.standupId,
+          status: stateMsg.status,
+          elapsedTime: stateMsg.elapsedTime,
+          interruptions: stateMsg.interruptions,
+        });
+      } else if (msg.type === 'tick') {
+        const tickMsg = msg as TickMessage;
+        setState(prev => ({ ...prev, elapsedTime: tickMsg.elapsedTime }));
       }
-
-      setConnectionStatus(reconnectDelayRef.current > INITIAL_RECONNECT_DELAY ? 'reconnecting' : 'connecting');
-      const ws = new WebSocket(`${WS_BASE}/ws/${teamId}`);
-      wsRef.current = ws;
-
-      ws.onopen = () => {
-        if (!isMountedRef.current) return;
-        console.log('WebSocket connected');
-        setConnectionStatus('connected');
-        setIsConnected(true);
-        // Reset reconnect delay on successful connection
-        reconnectDelayRef.current = INITIAL_RECONNECT_DELAY;
-      };
-
-      ws.onmessage = (event) => {
-        if (!isMountedRef.current) return;
-        try {
-          const msg = JSON.parse(event.data);
-          if (msg.type === 'state') {
-            setState({
-              currentSpeaker: msg.currentSpeaker,
-              standupId: msg.standupId,
-              status: msg.status,
-              elapsedTime: msg.elapsedTime,
-              interruptions: msg.interruptions,
-            });
-          } else if (msg.type === 'tick') {
-            setState(prev => ({ ...prev, elapsedTime: msg.elapsedTime }));
-          }
-        } catch (err) {
-          console.error('WebSocket message error:', err);
-        }
-      };
-
-      ws.onclose = () => {
-        if (!isMountedRef.current) return;
-        console.log('WebSocket disconnected');
-        setConnectionStatus('disconnected');
-        setIsConnected(false);
-
-        // Schedule reconnection with exponential backoff
-        const delay = reconnectDelayRef.current;
-        console.log(`Reconnecting in ${delay}ms...`);
-        reconnectTimeoutRef.current = setTimeout(() => {
-          if (isMountedRef.current) {
-            reconnectDelayRef.current = Math.min(
-              reconnectDelayRef.current * RECONNECT_BACKOFF_MULTIPLIER,
-              MAX_RECONNECT_DELAY
-            );
-            connect();
-          }
-        }, delay);
-      };
-
-      ws.onerror = (err) => {
-        console.error('WebSocket error:', err);
-        // onclose will be called after onerror, triggering reconnection
-      };
-    };
-
-    connect();
+    });
 
     return () => {
-      isMountedRef.current = false;
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current);
-      }
-      if (wsRef.current) {
-        wsRef.current.close();
-      }
+      unsubscribeStatus();
+      unsubscribeMessage();
+      // Note: Don't disconnect here - other components may be using the connection
     };
   }, [teamId]);
 
   const send = useCallback((data: object) => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify(data));
-    }
+    ConnectionManager.send(data);
   }, []);
 
   const startTimer = useCallback((speaker: TeamMember) => {
