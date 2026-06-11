@@ -56,3 +56,27 @@ export function RadialIndicator({ elapsed, expected, children, className }: Radi
     </div>
   );
 }
+
+interface LinearIndicatorProps {
+  elapsed: number;
+  expected: number;
+  className?: string;
+}
+
+export function LinearIndicator({ elapsed, expected, className }: LinearIndicatorProps) {
+  const { progress, zone } = getProgress(elapsed, expected);
+
+  return (
+    <div className={cn('h-1.5 w-full overflow-hidden rounded-full bg-muted', className)}>
+      <div
+        className={cn(
+          'h-full rounded-full transition-all duration-300 ease-out',
+          zone === 'safe' && 'bg-green-500',
+          zone === 'warning' && 'bg-amber-500',
+          zone === 'over' && 'bg-red-500'
+        )}
+        style={{ width: `${Math.min(progress, 100)}%` }}
+      />
+    </div>
+  );
+}

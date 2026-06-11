@@ -81,8 +81,8 @@ export function MemberSelector({
   };
 
   return (
-    <div className="space-y-4">
-      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
+    <div className="space-y-3 md:space-y-4">
+      <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-2 md:gap-3">
         {members.map((member) => {
           const stats = memberStats[member.id];
           const sparkline = trends.sparklines[member.id] || [];
@@ -97,12 +97,12 @@ export function MemberSelector({
             <div key={member.id} className="relative group">
               <Button
                 variant={isCurrentSpeaker ? 'default' : 'outline'}
-                className="w-full flex-col h-auto py-3 px-2 gap-0.5 cursor-pointer"
+                className="w-full flex-col h-auto py-2 px-2 md:py-3 gap-0.5 cursor-pointer"
                 onClick={() => onSelect(member)}
               >
                 {/* Name with trend arrow */}
                 <div className="flex items-center gap-1">
-                  <span className="truncate text-[18px] font-medium">{member.name}</span>
+                  <span className="truncate text-base md:text-[18px] font-medium">{member.name}</span>
                   {hasSparkline && <TrendArrow trend={trend} className="text-sm" />}
                 </div>
                 {member.isGuest && <Badge variant="secondary" className="text-[10px] px-1.5 py-0">Guest</Badge>}
@@ -110,7 +110,7 @@ export function MemberSelector({
                 {/* Current standup time */}
                 {standupTime > 0 && (
                   <div className={cn(
-                    "text-[20px] font-semibold font-mono mt-1",
+                    "text-base md:text-[20px] font-semibold font-mono mt-0.5 md:mt-1",
                     isCurrentSpeaker ? "text-primary-foreground" : "text-muted-foreground"
                   )}>
                     {formatTime(standupTime)}

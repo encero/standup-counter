@@ -1,12 +1,13 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useMemo } from 'react';
 import { Link } from 'react-router-dom';
-import { BarChart2, History, WifiOff, RefreshCw } from 'lucide-react';
+import { BarChart2, History, WifiOff, RefreshCw, CheckCircle2 } from 'lucide-react';
 import { useStandup } from '@/context/StandupContext';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { TimerDisplay } from '@/components/shared/TimerDisplay';
+import { useMediaQuery } from '@/hooks/useMediaQuery';
 import { MemberSelector } from '@/components/shared/MemberSelector';
-import { RadialIndicator } from '@/components/shared/TimeIndicator';
+import { RadialIndicator, LinearIndicator } from '@/components/shared/TimeIndicator';
 import { Settings } from '@/components/Settings';
 import { StandupSummary } from '@/components/StandupSummary';
 import { SyncNotesPanel, SyncNotesDialog } from '@/components/SyncNotes';
@@ -47,6 +48,11 @@ export function StandupTimer() {
   const [reviewNotes, setReviewNotes] = useState<SyncNote[]>([]);
   const expectedMs = expectedSeconds * 1000;
 
+  // Below Tailwind's md breakpoint (sidebar widths) we render a compact linear
+  // timer; at md+ the full radial dial. Rendering only one keeps the speaker /
+  // time text single-sourced in the DOM (no duplicate-label a11y or test churn).
+  const isWide = useMediaQuery('(min-width: 768px)');
+
   // The "end standup" broadcast reaches every client (including the one that
   // clicked End Standup), so route both local and remote ends through here and
   // dedupe by standup id to avoid re-opening dialogs the user already dismissed.
@@ -77,6 +83,19 @@ export function StandupTimer() {
 
   const canEnd = Boolean(currentStandupId) || syncNotes.length > 0;
 
+  // Everyone has had a turn once every team member has a recorded session in the
+  // active standup (or is mid-turn). Drives the End Standup button's "wrap up"
+  // call-to-action so the moderator knows the round is complete.
+  const allSpoken = useMemo(() => {
+    if (!currentStandupId || teamMembers.length === 0) return false;
+    const spoken = new Set<string>();
+    for (const s of sessions) {
+      if (s.standupId === currentStandupId && s.duration > 0) spoken.add(s.memberId);
+    }
+    if (currentSpeaker) spoken.add(currentSpeaker.id);
+    return teamMembers.every(m => spoken.has(m.id));
+  }, [sessions, currentStandupId, currentSpeaker, teamMembers]);
+
   const handleEndStandup = () => {
     if (!canEnd) return;
     // stopTimer saves the current speaker's session and tells the server to end;
@@ -104,109 +123,149 @@ export function StandupTimer() {
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900 p-4 relative">
-      {/* Connection Status - Only shown when there's an issue */}
-      {showConnectionStatus && (
-        <div
-          className={cn(
-            "absolute top-4 left-4 z-10 flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium transition-all",
-            connectionStatus === 'disconnected' && "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-400",
-            connectionStatus === 'reconnecting' && "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400",
-            connectionStatus === 'connecting' && "bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-400"
-          )}
-        >
-          {connectionStatus === 'disconnected' && (
-            <>
-              <WifiOff className="h-4 w-4" />
-              <span>Disconnected</span>
-            </>
-          )}
-          {connectionStatus === 'reconnecting' && (
-            <>
-              <RefreshCw className="h-4 w-4 animate-spin" />
-              <span>Reconnecting...</span>
-            </>
-          )}
-          {connectionStatus === 'connecting' && (
-            <>
-              <RefreshCw className="h-4 w-4 animate-spin" />
-              <span>Connecting...</span>
-            </>
-          )}
+    <div className="min-h-screen bg-gradient-to-b from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900 p-4">
+      <div className="max-w-4xl mx-auto space-y-3 md:space-y-6">
+        {/* Toolbar: connection status (when relevant) + utility actions */}
+        <div className="flex h-9 items-center justify-between gap-2">
+          <div className="min-w-0">
+            {showConnectionStatus && (
+              <div
+                className={cn(
+                  "flex items-center gap-2 px-3 py-1.5 rounded-full text-sm font-medium transition-all",
+                  connectionStatus === 'disconnected' && "bg-red-100 text-red-700 dark:bg-red-950 dark:text-red-400",
+                  connectionStatus === 'reconnecting' && "bg-amber-100 text-amber-700 dark:bg-amber-950 dark:text-amber-400",
+                  connectionStatus === 'connecting' && "bg-blue-100 text-blue-700 dark:bg-blue-950 dark:text-blue-400"
+                )}
+              >
+                {connectionStatus === 'disconnected' && (
+                  <>
+                    <WifiOff className="h-4 w-4" />
+                    <span>Disconnected</span>
+                  </>
+                )}
+                {connectionStatus === 'reconnecting' && (
+                  <>
+                    <RefreshCw className="h-4 w-4 animate-spin" />
+                    <span>Reconnecting...</span>
+                  </>
+                )}
+                {connectionStatus === 'connecting' && (
+                  <>
+                    <RefreshCw className="h-4 w-4 animate-spin" />
+                    <span>Connecting...</span>
+                  </>
+                )}
+              </div>
+            )}
+          </div>
+          <div className="flex shrink-0 items-center gap-1">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="h-9 w-9"
+              onClick={handleShowLastSummary}
+              title="Last standup summary"
+            >
+              <History className="h-5 w-5" />
+            </Button>
+            <Link to={`/${teamId}/trends`}>
+              <Button variant="ghost" size="icon" className="h-9 w-9" title="Trends">
+                <BarChart2 className="h-5 w-5" />
+              </Button>
+            </Link>
+            <Settings
+              teamId={teamId}
+              expectedSeconds={expectedSeconds}
+              onExpectedSecondsChange={setExpectedSeconds}
+              teamMembers={teamMembers}
+              onAddMember={addMember}
+              onRemoveMember={removeMember}
+              onClearSessions={clearSessions}
+              disabled={status !== 'idle'}
+            />
+          </div>
         </div>
-      )}
 
-      {/* Top bar icons - Absolute positioned */}
-      <div className="absolute top-4 right-4 z-10 flex items-center gap-2">
-        <Button
-          variant="ghost"
-          size="icon"
-          className="h-9 w-9"
-          onClick={handleShowLastSummary}
-          title="Last standup summary"
-        >
-          <History className="h-5 w-5" />
-        </Button>
-        <Link to={`/${teamId}/trends`}>
-          <Button variant="ghost" size="icon" className="h-9 w-9">
-            <BarChart2 className="h-5 w-5" />
-          </Button>
-        </Link>
-        <Settings
-          teamId={teamId}
-          expectedSeconds={expectedSeconds}
-          onExpectedSecondsChange={setExpectedSeconds}
-          teamMembers={teamMembers}
-          onAddMember={addMember}
-          onRemoveMember={removeMember}
-          onClearSessions={clearSessions}
-          disabled={status !== 'idle'}
-        />
-      </div>
-
-      <div className="max-w-4xl mx-auto space-y-6">
-        {/* Timer Card */}
+        {/* Timer Card — compact linear header on narrow/sidebar widths,
+            full radial dial on wider screens. */}
         <Card
-          className={`border-2 relative ${status !== 'idle' ? 'cursor-pointer' : ''}`}
+          className={cn(
+            'border-2 relative',
+            !isWide && 'gap-0 py-0',
+            status !== 'idle' && 'cursor-pointer'
+          )}
           onClick={status === 'idle' ? undefined : (status === 'paused' ? resumeTimer : pauseTimer)}
         >
-          {interruptions > 0 && (
-            <span className="absolute top-3 left-3 text-xs text-muted-foreground">
-              Paused {interruptions}×
-            </span>
+          {isWide ? (
+            /* Expansive (full-page) layout */
+            <>
+              {interruptions > 0 && (
+                <span className="absolute top-3 left-3 text-xs text-muted-foreground">
+                  Paused {interruptions}×
+                </span>
+              )}
+              <CardHeader className="text-center pb-2">
+                <CardTitle className="text-lg text-muted-foreground">
+                  {currentSpeaker ? `${currentSpeaker.name} is speaking` : 'Select a speaker to begin'}
+                </CardTitle>
+              </CardHeader>
+              <CardContent className="flex flex-col items-center py-8">
+                <RadialIndicator elapsed={elapsedTime} expected={expectedMs}>
+                  <TimerDisplay
+                    time={formatTime(elapsedTime)}
+                    status={status}
+                    size="xl"
+                  />
+                </RadialIndicator>
+              </CardContent>
+            </>
+          ) : (
+            /* Compact (sidebar) layout */
+            <CardContent className="p-3 space-y-2">
+              <div className="flex items-baseline justify-between gap-3">
+                <span className="flex items-baseline gap-2 min-w-0 text-sm font-medium text-muted-foreground">
+                  <span className="truncate">
+                    {currentSpeaker ? `${currentSpeaker.name} is speaking` : 'Select a speaker to begin'}
+                  </span>
+                  {interruptions > 0 && (
+                    <span className="shrink-0 text-xs text-muted-foreground/70 tabular-nums">paused {interruptions}×</span>
+                  )}
+                </span>
+                <TimerDisplay
+                  time={formatTime(elapsedTime)}
+                  status={status}
+                  size="sm"
+                  className="text-right shrink-0"
+                />
+              </div>
+              <LinearIndicator elapsed={elapsedTime} expected={expectedMs} />
+            </CardContent>
           )}
-          <CardHeader className="text-center pb-2">
-            <CardTitle className="text-lg text-muted-foreground">
-              {currentSpeaker ? `${currentSpeaker.name} is speaking` : 'Select a speaker to begin'}
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="flex flex-col items-center py-8">
-            <RadialIndicator elapsed={elapsedTime} expected={expectedMs}>
-              <TimerDisplay
-                time={formatTime(elapsedTime)}
-                status={status}
-                size="xl"
-              />
-            </RadialIndicator>
-          </CardContent>
         </Card>
 
-        {/* End Standup Button */}
+        {/* End Standup Button — subdued until everyone has spoken, then a CTA */}
         <Button
-          variant="outline"
+          variant={allSpoken ? 'default' : 'outline'}
+          size="sm"
           onClick={handleEndStandup}
           disabled={!canEnd}
-          className="w-full text-muted-foreground"
+          className={cn(
+            'w-full h-11 md:h-12 text-sm transition-all',
+            allSpoken
+              ? 'bg-green-600 text-white shadow-sm ring-2 ring-green-500/30 [a]:hover:bg-green-600 hover:bg-green-600/90'
+              : 'text-muted-foreground'
+          )}
         >
-          End Standup
+          {allSpoken && <CheckCircle2 className="h-4 w-4" data-icon="inline-start" />}
+          {allSpoken ? 'Everyone spoke — End Standup' : 'End Standup'}
         </Button>
 
         {/* Team Members */}
-        <Card>
-          <CardHeader>
-            <CardTitle>Team Members</CardTitle>
+        <Card className="gap-2 py-3 md:gap-4 md:py-4">
+          <CardHeader className="px-3 md:px-4">
+            <CardTitle className="text-base md:text-lg">Team Members</CardTitle>
           </CardHeader>
-          <CardContent>
+          <CardContent className="px-3 md:px-4">
             <MemberSelector
               members={teamMembers}
               currentSpeaker={currentSpeaker}
