@@ -3,6 +3,12 @@ FROM node:22-alpine AS builder
 
 WORKDIR /app
 
+# App version (e.g. git short SHA) - baked into the client bundle so it can be
+# compared against the server's runtime version. Pass with:
+#   docker build --build-arg APP_VERSION=$(git rev-parse --short HEAD) .
+ARG APP_VERSION=dev
+ENV APP_VERSION=$APP_VERSION
+
 # Copy package files
 COPY package*.json ./
 
@@ -19,6 +25,10 @@ RUN npm run build
 FROM node:22-alpine AS production
 
 WORKDIR /app
+
+# Same version the client was built with - the server reports it at runtime.
+ARG APP_VERSION=dev
+ENV APP_VERSION=$APP_VERSION
 
 # Install build dependencies for native modules (better-sqlite3)
 RUN apk add --no-cache python3 make g++ sqlite

@@ -12,6 +12,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3001;
 
+// App version. Baked into the client bundle at build time (see vite.config.ts)
+// and read here at runtime from the same env var. When a redeploy changes this,
+// connected clients detect the mismatch on reconnect and reload themselves.
+const APP_VERSION = process.env.APP_VERSION || 'dev';
+
 // Get local network IP addresses
 function getLocalIPs(): string[] {
   const nets = networkInterfaces();
@@ -138,6 +143,10 @@ wss.on('connection', (ws, req) => {
 
   console.log(`Client connected to team: ${teamId}`);
   getTeamClients(teamId).add(ws);
+
+  // Announce the server version first so the client can detect a version
+  // mismatch (e.g. after a redeploy) and force a reload.
+  ws.send(JSON.stringify({ type: 'hello', version: APP_VERSION }));
 
   // Send current state to new client
   const state = getTeamState(teamId);
@@ -302,6 +311,11 @@ function updateStandupAggregate(standupId: string, teamId: string) {
     `).run(standupId, teamId, dateStr, dayOfWeek, aggregate.startTime, aggregate.endTime, aggregate.totalDuration, aggregate.speakerCount, aggregate.totalInterruptions);
   }
 }
+
+// Version endpoint (no auth required) - lets the client verify it matches the server
+app.get('/api/version', (_req, res) => {
+  res.json({ version: APP_VERSION });
+});
 
 // Server info endpoint (no auth required)
 app.get('/api/server-info', (_req, res) => {

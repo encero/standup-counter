@@ -28,6 +28,12 @@ const RECONNECT_BACKOFF_MULTIPLIER = 2;
 const HEARTBEAT_INTERVAL = 5000; // 5 seconds
 const HEARTBEAT_TIMEOUT = 3000;  // 3 seconds to receive pong
 
+// Version of this client bundle, baked in at build time (see vite.config.ts).
+const CLIENT_VERSION = __APP_VERSION__;
+// Guards against reload loops if the served bundle and server version somehow
+// stay out of sync (e.g. misconfiguration) rather than converging on reload.
+const RELOAD_GUARD_KEY = 'version-reload-attempted';
+
 class ConnectionManagerImpl {
   private ws: WebSocket | null = null;
   private teamId: string | null = null;
@@ -110,6 +116,12 @@ class ConnectionManagerImpl {
       try {
         const data = JSON.parse(event.data);
         
+        // Handle server version announcement - reload on mismatch
+        if (data.type === 'hello') {
+          this.checkVersion(data.version);
+          return;
+        }
+
         // Handle pong response
         if (data.type === 'pong') {
           this.awaitingPong = false;
@@ -137,6 +149,35 @@ class ConnectionManagerImpl {
     ws.onerror = (err) => {
       console.error('WebSocket error:', err);
     };
+  }
+
+  // Compare the server's version against this client's baked-in version.
+  // On mismatch, force a one-time reload so the browser fetches the new bundle.
+  private checkVersion(serverVersion: unknown) {
+    if (typeof serverVersion !== 'string' || !serverVersion) return;
+
+    if (serverVersion === CLIENT_VERSION) {
+      // In sync - clear any prior guard so a future mismatch can reload again.
+      try { sessionStorage.removeItem(RELOAD_GUARD_KEY); } catch { /* ignore */ }
+      return;
+    }
+
+    console.warn(`Version mismatch: client=${CLIENT_VERSION}, server=${serverVersion}`);
+
+    // Avoid an infinite reload loop if the freshly loaded bundle still mismatches.
+    let alreadyTried = false;
+    try {
+      alreadyTried = sessionStorage.getItem(RELOAD_GUARD_KEY) === serverVersion;
+      sessionStorage.setItem(RELOAD_GUARD_KEY, serverVersion);
+    } catch { /* sessionStorage unavailable - fall through and reload once */ }
+
+    if (alreadyTried) {
+      console.warn('Already reloaded for this server version; skipping to avoid a loop.');
+      return;
+    }
+
+    console.warn('Reloading to pick up the new version...');
+    window.location.reload();
   }
 
   private startHeartbeat() {
