@@ -156,7 +156,7 @@ function migrateOrphanedData(teamId: string) {
 
 // Command router
 switch (command) {
-  case 'create':
+  case 'create': {
     const name = process.argv[3];
     if (!name) {
       console.error('Usage: team create <name>');
@@ -164,10 +164,11 @@ switch (command) {
     }
     createTeam(name);
     break;
+  }
   case 'list':
     listTeams();
     break;
-  case 'delete':
+  case 'delete': {
     const deleteId = process.argv[3];
     if (!deleteId) {
       console.error('Usage: team delete <id>');
@@ -175,7 +176,8 @@ switch (command) {
     }
     deleteTeam(deleteId);
     break;
-  case 'add-member':
+  }
+  case 'add-member': {
     const teamId = process.argv[3];
     const memberName = process.argv[4];
     if (!teamId || !memberName) {
@@ -184,7 +186,8 @@ switch (command) {
     }
     addMember(teamId, memberName);
     break;
-  case 'info':
+  }
+  case 'info': {
     const infoId = process.argv[3];
     if (!infoId) {
       console.error('Usage: team info <id>');
@@ -192,7 +195,8 @@ switch (command) {
     }
     showTeamInfo(infoId);
     break;
-  case 'migrate':
+  }
+  case 'migrate': {
     const migrateTeamId = process.argv[3];
     if (!migrateTeamId) {
       console.error('Usage: team migrate <team_id>');
@@ -200,6 +204,7 @@ switch (command) {
     }
     migrateOrphanedData(migrateTeamId);
     break;
+  }
   default:
     console.log(`
 Team Management CLI

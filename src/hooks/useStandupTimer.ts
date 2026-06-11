@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ConnectionManager, type ConnectionStatus } from '@/lib/ConnectionManager';
-import type { TeamMember, SpeakerSession, TimerStatus } from '@/types/standup';
+import type { TeamMember, SpeakerSession, SyncNote, TimerStatus } from '@/types/standup';
 
 export type { ConnectionStatus };
 
@@ -40,6 +40,8 @@ export function useStandupTimer(teamId: string) {
   const [interruptions, setInterruptions] = useState(0);
   const [currentStandupId, setCurrentStandupId] = useState<string | null>(null);
   const [endedStandupId, setEndedStandupId] = useState<string | null>(null);
+  const [syncNotes, setSyncNotes] = useState<SyncNote[]>([]);
+  const [endedStandupNotes, setEndedStandupNotes] = useState<SyncNote[]>([]);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting');
 
   const startTimeRef = useRef<number | null>(null);
@@ -154,10 +156,22 @@ export function useStandupTimer(teamId: string) {
         startTimeRef.current = msg.startTime as number | null;
         totalPausedRef.current = msg.totalPaused as number;
         pauseStartRef.current = msg.pauseStart as number | null;
+        setSyncNotes((msg.syncNotes as SyncNote[]) ?? []);
       } else if (msg.type === 'tick') {
         setElapsedTime(msg.elapsedTime as number);
+      } else if (msg.type === 'notes') {
+        // Sync notes added/removed (possibly by another client)
+        setSyncNotes((msg.syncNotes as SyncNote[]) ?? []);
+        // Adding the first note mints a standupId server-side; mirror it so
+        // "End Standup" becomes available even before anyone has spoken.
+        const noteStandupId = msg.standupId as string | null;
+        if (noteStandupId) {
+          standupIdRef.current = noteStandupId;
+          setCurrentStandupId(noteStandupId);
+        }
       } else if (msg.type === 'end_standup') {
         // Standup was ended (possibly from control page) - trigger summary
+        setEndedStandupNotes((msg.syncNotes as SyncNote[]) ?? []);
         setEndedStandupId(msg.standupId as string);
       }
     });
@@ -240,6 +254,16 @@ export function useStandupTimer(teamId: string) {
       .catch(err => console.error('Failed to delete member:', err));
   }, [API_URL]);
 
+  const addSyncNote = useCallback((text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    wsSend({ type: 'add_note', text: trimmed });
+  }, [wsSend]);
+
+  const removeSyncNote = useCallback((id: string) => {
+    wsSend({ type: 'remove_note', id });
+  }, [wsSend]);
+
   const clearSessions = useCallback(() => {
     setSessions([]);
     // Clear from SQLite via ConnectionManager
@@ -256,6 +280,7 @@ export function useStandupTimer(teamId: string) {
 
   const clearEndedStandupId = useCallback(() => {
     setEndedStandupId(null);
+    setEndedStandupNotes([]);
   }, []);
 
   return {
@@ -264,6 +289,8 @@ export function useStandupTimer(teamId: string) {
     currentSpeaker,
     currentStandupId,
     endedStandupId,
+    syncNotes,
+    endedStandupNotes,
     status,
     elapsedTime,
     interruptions,
@@ -275,6 +302,8 @@ export function useStandupTimer(teamId: string) {
     stopTimer,
     addMember,
     removeMember,
+    addSyncNote,
+    removeSyncNote,
     clearSessions,
     clearEndedStandupId,
     formatTime,

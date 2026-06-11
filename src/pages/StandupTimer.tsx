@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { Link } from 'react-router-dom';
 import { BarChart2, History, WifiOff, RefreshCw } from 'lucide-react';
 import { useStandup } from '@/context/StandupContext';
@@ -9,6 +9,8 @@ import { MemberSelector } from '@/components/shared/MemberSelector';
 import { RadialIndicator } from '@/components/shared/TimeIndicator';
 import { Settings } from '@/components/Settings';
 import { StandupSummary } from '@/components/StandupSummary';
+import { SyncNotesPanel, SyncNotesDialog } from '@/components/SyncNotes';
+import type { SyncNote } from '@/types/standup';
 import { cn } from '@/lib/utils';
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:3001';
@@ -16,54 +18,76 @@ const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:3001';
 export function StandupTimer() {
   const {
     teamId, teamMembers, sessions, currentSpeaker, currentStandupId, status, elapsedTime, interruptions,
-    endedStandupId, connectionStatus, startTimer, pauseTimer, resumeTimer, stopTimer, addMember, removeMember,
-    clearSessions, clearEndedStandupId, formatTime,
+    endedStandupId, syncNotes, endedStandupNotes, connectionStatus, startTimer, pauseTimer, resumeTimer,
+    stopTimer, addMember, removeMember, addSyncNote, removeSyncNote, clearSessions, clearEndedStandupId,
+    formatTime,
   } = useStandup();
 
-  // Show connection issues after a short delay to avoid flashing during initial connection
-  const [showConnectionStatus, setShowConnectionStatus] = useState(false);
+  // Disconnected/reconnecting are surfaced immediately; a transient 'connecting'
+  // is only surfaced after a short delay to avoid flashing during initial load.
+  const [connectingTooLong, setConnectingTooLong] = useState(false);
   useEffect(() => {
-    if (connectionStatus === 'connected') {
-      setShowConnectionStatus(false);
-    } else if (connectionStatus === 'disconnected' || connectionStatus === 'reconnecting') {
-      // Show immediately when disconnected/reconnecting
-      setShowConnectionStatus(true);
-    } else {
-      // For 'connecting', show after 2 seconds if still connecting
-      const timeout = setTimeout(() => {
-        if (connectionStatus === 'connecting') {
-          setShowConnectionStatus(true);
-        }
-      }, 2000);
-      return () => clearTimeout(timeout);
-    }
+    if (connectionStatus !== 'connecting') return;
+    const timeout = setTimeout(() => setConnectingTooLong(true), 2000);
+    return () => {
+      clearTimeout(timeout);
+      setConnectingTooLong(false);
+    };
   }, [connectionStatus]);
+
+  const showConnectionStatus =
+    connectionStatus === 'disconnected' ||
+    connectionStatus === 'reconnecting' ||
+    (connectionStatus === 'connecting' && connectingTooLong);
 
   const [expectedSeconds, setExpectedSeconds] = useState(90);
   const [showSummary, setShowSummary] = useState(false);
   const [summaryStandupId, setSummaryStandupId] = useState<string | null>(null);
+  const [showNotesReview, setShowNotesReview] = useState(false);
+  const [reviewNotes, setReviewNotes] = useState<SyncNote[]>([]);
   const expectedMs = expectedSeconds * 1000;
 
-  // Show summary when standup is ended (e.g., from control page)
+  // The "end standup" broadcast reaches every client (including the one that
+  // clicked End Standup), so route both local and remote ends through here and
+  // dedupe by standup id to avoid re-opening dialogs the user already dismissed.
+  const handledEndRef = useRef<string | null>(null);
+  const beginEndFlow = (standupId: string | null, notes: SyncNote[]) => {
+    if (standupId && handledEndRef.current === standupId) return;
+    handledEndRef.current = standupId;
+    setSummaryStandupId(standupId);
+    if (notes.length > 0) {
+      setReviewNotes(notes);
+      setShowNotesReview(true);
+    } else {
+      setShowSummary(true);
+    }
+  };
+
+  // Standup ended (locally or from the control page) - review notes, then summary.
+  // Synchronizing this WebSocket-driven event into dialog state is exactly what
+  // an effect is for, so the set-state-in-effect heuristic is suppressed here.
   useEffect(() => {
     if (endedStandupId) {
-      setSummaryStandupId(endedStandupId);
-      setShowSummary(true);
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      beginEndFlow(endedStandupId, endedStandupNotes);
       clearEndedStandupId();
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [endedStandupId, clearEndedStandupId]);
 
+  const canEnd = Boolean(currentStandupId) || syncNotes.length > 0;
+
   const handleEndStandup = () => {
-    // No-op if no one has spoken yet
-    if (!currentStandupId) {
-      return;
-    }
-    // Save the standup ID before stopping (stopTimer resets it to null)
-    setSummaryStandupId(currentStandupId);
-    if (status !== 'idle') {
+    if (!canEnd) return;
+    // stopTimer saves the current speaker's session and tells the server to end;
+    // the resulting end_standup broadcast drives the dialogs via beginEndFlow.
+    // Capture notes now in case this client is offline and never sees the echo.
+    const notes = syncNotes;
+    const standupId = currentStandupId;
+    if (status !== 'idle' || standupId) {
       stopTimer();
     }
-    setShowSummary(true);
+    beginEndFlow(standupId, notes);
   };
 
   const handleShowLastSummary = async () => {
@@ -171,7 +195,7 @@ export function StandupTimer() {
         <Button
           variant="outline"
           onClick={handleEndStandup}
-          disabled={!currentStandupId}
+          disabled={!canEnd}
           className="w-full text-muted-foreground"
         >
           End Standup
@@ -197,12 +221,37 @@ export function StandupTimer() {
             />
           </CardContent>
         </Card>
+
+        {/* Sync / Parking Lot - quick notes to revisit after standup */}
+        <SyncNotesPanel
+          notes={syncNotes}
+          onAdd={addSyncNote}
+          onRemove={removeSyncNote}
+          disabled={connectionStatus !== 'connected'}
+        />
       </div>
+
+      {/* Sync Notes Review - shown first when a standup ends with parked topics */}
+      <SyncNotesDialog
+        open={showNotesReview}
+        notes={reviewNotes}
+        onContinue={() => {
+          setShowNotesReview(false);
+          setShowSummary(true);
+        }}
+        onClose={() => {
+          setShowNotesReview(false);
+          handledEndRef.current = null;
+        }}
+      />
 
       {/* Summary Dialog */}
       <StandupSummary
         open={showSummary}
-        onClose={() => setShowSummary(false)}
+        onClose={() => {
+          setShowSummary(false);
+          handledEndRef.current = null;
+        }}
         sessions={sessions}
         teamMembers={teamMembers}
         teamId={teamId}

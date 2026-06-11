@@ -3,11 +3,14 @@
  * Tests real-time timer sync, start/pause/resume/stop, multi-client synchronization
  */
 import { test, expect } from '@playwright/test';
-import { WebSocket } from 'ws';
-import { BASE_URL, generateTeamId, TEST_DB_PATH } from './test-helpers';
+import { WebSocket, type RawData } from 'ws';
+import { generateTeamId, TEST_DB_PATH } from './test-helpers';
 import Database from 'better-sqlite3';
 
 const WS_BASE = 'ws://localhost:3001';
+
+// Parsed WebSocket message; concrete fields are read ad hoc in assertions.
+type WsMessage = { type: string; [key: string]: unknown };
 
 // Helper to create a team directly in the database
 function createTeamInDb(name: string, members: string[] = []): string {
@@ -26,7 +29,7 @@ function createTeamInDb(name: string, members: string[] = []): string {
 }
 
 // Helper to create a WebSocket connection that returns initial state
-function connectWebSocket(teamId: string): Promise<{ ws: WebSocket; initialState: any }> {
+function connectWebSocket(teamId: string): Promise<{ ws: WebSocket; initialState: WsMessage }> {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`${WS_BASE}/ws/${teamId}`);
     
@@ -52,11 +55,11 @@ function connectWebSocket(teamId: string): Promise<{ ws: WebSocket; initialState
 }
 
 // Helper to wait for a specific message type
-function waitForMessage(ws: WebSocket, type: string, timeout = 5000): Promise<any> {
+function waitForMessage(ws: WebSocket, type: string, timeout = 5000): Promise<WsMessage> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`Timeout waiting for ${type} message`)), timeout);
-    
-    const handler = (data: any) => {
+
+    const handler = (data: RawData) => {
       try {
         const msg = JSON.parse(data.toString());
         if (msg.type === type) {
@@ -64,7 +67,7 @@ function waitForMessage(ws: WebSocket, type: string, timeout = 5000): Promise<an
           ws.off('message', handler);
           resolve(msg);
         }
-      } catch (err) {
+      } catch {
         // Ignore parse errors
       }
     };
@@ -74,7 +77,7 @@ function waitForMessage(ws: WebSocket, type: string, timeout = 5000): Promise<an
 }
 
 // Helper to send a message and wait for state response
-async function sendAndWaitForState(ws: WebSocket, message: object): Promise<any> {
+async function sendAndWaitForState(ws: WebSocket, message: object): Promise<WsMessage> {
   ws.send(JSON.stringify(message));
   return waitForMessage(ws, 'state');
 }
@@ -96,7 +99,7 @@ test.describe('WebSocket Connection', () => {
     const ws = new WebSocket(`${WS_BASE}/ws/nonexistent`);
     
     await new Promise<void>((resolve, reject) => {
-      ws.on('close', (code, reason) => {
+      ws.on('close', (code) => {
         expect(code).toBe(4001);
         resolve();
       });
@@ -323,6 +326,113 @@ test.describe('Multi-Client Synchronization', () => {
     const state = await sendAndWaitForState(client2, { type: 'getState' });
     expect(state.status).toBe('running');
 
+    client2.close();
+  });
+});
+
+test.describe('Sync Notes', () => {
+  test('add_note mints a standupId and broadcasts the note', async () => {
+    const teamId = createTeamInDb('Notes Team');
+    const { ws } = await connectWebSocket(teamId);
+
+    ws.send(JSON.stringify({ type: 'add_note', text: 'Discuss deploy plan' }));
+    const notes = await waitForMessage(ws, 'notes');
+
+    expect(notes.standupId).toBeTruthy();
+    expect(notes.syncNotes).toHaveLength(1);
+    expect(notes.syncNotes[0].text).toBe('Discuss deploy plan');
+    expect(notes.syncNotes[0].id).toBeTruthy();
+
+    ws.close();
+  });
+
+  test('a note added before standup keeps its standupId once a speaker starts', async () => {
+    const teamId = createTeamInDb('Notes Reuse Team', ['Alice']);
+    const { ws } = await connectWebSocket(teamId);
+
+    ws.send(JSON.stringify({ type: 'add_note', text: 'Pre-standup topic' }));
+    const notes = await waitForMessage(ws, 'notes');
+    const noteStandupId = notes.standupId;
+
+    const speaker = { id: crypto.randomUUID(), name: 'Alice' };
+    const state = await sendAndWaitForState(ws, { type: 'start', speaker });
+
+    expect(state.standupId).toBe(noteStandupId);
+    expect(state.syncNotes).toHaveLength(1);
+
+    ws.close();
+  });
+
+  test('remove_note removes the note and broadcasts the update', async () => {
+    const teamId = createTeamInDb('Notes Remove Team');
+    const { ws } = await connectWebSocket(teamId);
+
+    ws.send(JSON.stringify({ type: 'add_note', text: 'Temporary note' }));
+    const added = await waitForMessage(ws, 'notes');
+    const noteId = added.syncNotes[0].id;
+
+    ws.send(JSON.stringify({ type: 'remove_note', id: noteId }));
+    const removed = await waitForMessage(ws, 'notes');
+
+    expect(removed.syncNotes).toHaveLength(0);
+
+    ws.close();
+  });
+
+  test('blank notes are ignored', async () => {
+    const teamId = createTeamInDb('Blank Notes Team', ['Bob']);
+    const { ws } = await connectWebSocket(teamId);
+
+    // A blank note should not broadcast; a real one immediately after should be the first.
+    ws.send(JSON.stringify({ type: 'add_note', text: '   ' }));
+    ws.send(JSON.stringify({ type: 'add_note', text: 'Real note' }));
+    const notes = await waitForMessage(ws, 'notes');
+
+    expect(notes.syncNotes).toHaveLength(1);
+    expect(notes.syncNotes[0].text).toBe('Real note');
+
+    ws.close();
+  });
+
+  test('stop broadcasts end_standup with the captured notes then clears them', async () => {
+    const teamId = createTeamInDb('Notes End Team', ['Carol']);
+    const { ws } = await connectWebSocket(teamId);
+
+    const speaker = { id: crypto.randomUUID(), name: 'Carol' };
+    const startState = await sendAndWaitForState(ws, { type: 'start', speaker });
+    const standupId = startState.standupId;
+
+    ws.send(JSON.stringify({ type: 'add_note', text: 'Follow up offline' }));
+    await waitForMessage(ws, 'notes');
+
+    const endMsgPromise = waitForMessage(ws, 'end_standup');
+    const stateMsgPromise = waitForMessage(ws, 'state');
+    ws.send(JSON.stringify({ type: 'stop' }));
+
+    const endMsg = await endMsgPromise;
+    expect(endMsg.standupId).toBe(standupId);
+    expect(endMsg.syncNotes).toHaveLength(1);
+    expect(endMsg.syncNotes[0].text).toBe('Follow up offline');
+
+    const stoppedState = await stateMsgPromise;
+    expect(stoppedState.syncNotes).toHaveLength(0);
+
+    ws.close();
+  });
+
+  test('notes are broadcast to all connected clients', async () => {
+    const teamId = createTeamInDb('Notes Multi-Client Team');
+    const { ws: client1 } = await connectWebSocket(teamId);
+    const { ws: client2 } = await connectWebSocket(teamId);
+
+    const notesPromise = waitForMessage(client2, 'notes');
+    client1.send(JSON.stringify({ type: 'add_note', text: 'Shared topic' }));
+
+    const notes = await notesPromise;
+    expect(notes.syncNotes).toHaveLength(1);
+    expect(notes.syncNotes[0].text).toBe('Shared topic');
+
+    client1.close();
     client2.close();
   });
 });

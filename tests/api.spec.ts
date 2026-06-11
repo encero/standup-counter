@@ -77,9 +77,9 @@ test.describe('Team Members API', () => {
     
     expect(status).toBe(200);
     expect(data.length).toBe(3);
-    expect(data.map((m: any) => m.name)).toContain('Alice');
-    expect(data.map((m: any) => m.name)).toContain('Bob');
-    expect(data.map((m: any) => m.name)).toContain('Charlie');
+    expect(data.map((m: { name: string }) => m.name)).toContain('Alice');
+    expect(data.map((m: { name: string }) => m.name)).toContain('Bob');
+    expect(data.map((m: { name: string }) => m.name)).toContain('Charlie');
   });
 
   test('POST /api/:teamId/members creates a new member', async () => {
@@ -117,7 +117,7 @@ test.describe('Team Members API', () => {
     
     // Verify guest flag is persisted
     const { data: members } = await api('GET', `/api/${teamId}/members`);
-    const guest = members.find((m: any) => m.name === 'Guest User');
+    const guest = members.find((m: { name: string; isGuest: boolean }) => m.name === "Guest User");
     expect(guest.isGuest).toBe(true);
   });
 
@@ -211,7 +211,7 @@ test.describe('Sessions API', () => {
 
     // Verify update was applied
     const { data: sessions } = await api('GET', `/api/${teamId}/sessions`);
-    const session = sessions.find((s: any) => s.id === sessionId);
+    const session = sessions.find((s: { id: string }) => s.id === sessionId);
     expect(session.duration).toBe(90000);
     expect(session.interruptions).toBe(1);
   });
@@ -249,6 +249,37 @@ test.describe('Sessions API', () => {
     // Verify sessions are gone
     ({ data: sessions } = await api('GET', `/api/${teamId}/sessions`));
     expect(sessions.length).toBe(0);
+  });
+});
+
+test.describe('Sync Notes API', () => {
+  test('GET /api/:teamId/notes returns empty array without a standupId', async () => {
+    const teamId = createTeamInDb('Notes API Team');
+    const { status, data } = await api('GET', `/api/${teamId}/notes`);
+
+    expect(status).toBe(200);
+    expect(Array.isArray(data)).toBe(true);
+    expect(data.length).toBe(0);
+  });
+
+  test('GET /api/:teamId/notes returns a standup\'s notes in chronological order', async () => {
+    const teamId = createTeamInDb('Notes API Team');
+    const standupId = crypto.randomUUID();
+
+    const db = new Database(TEST_DB_PATH);
+    const insert = db.prepare(
+      'INSERT INTO sync_notes (id, team_id, standup_id, text, created_at) VALUES (?, ?, ?, ?, ?)'
+    );
+    insert.run(crypto.randomUUID(), teamId, standupId, 'Second', 2000);
+    insert.run(crypto.randomUUID(), teamId, standupId, 'First', 1000);
+    // A note for a different standup should not leak in
+    insert.run(crypto.randomUUID(), teamId, crypto.randomUUID(), 'Other standup', 1500);
+    db.close();
+
+    const { status, data } = await api('GET', `/api/${teamId}/notes?standupId=${standupId}`);
+
+    expect(status).toBe(200);
+    expect(data.map((n: { text: string }) => n.text)).toEqual(['First', 'Second']);
   });
 });
 
@@ -293,7 +324,7 @@ test.describe('Team Settings API', () => {
 
 test.describe('Trends API', () => {
   // Helper to create standup data
-  async function createStandupData(teamId: string, memberNames: string[]) {
+  async function createStandupData(teamId: string) {
     const { data: members } = await api('GET', `/api/${teamId}/members`);
     const now = Date.now();
 
@@ -320,7 +351,7 @@ test.describe('Trends API', () => {
 
   test('GET /api/:teamId/trends/standups returns standup history', async () => {
     const teamId = createTeamInDb('Trends Test Team', ['Alice', 'Bob']);
-    await createStandupData(teamId, ['Alice', 'Bob']);
+    await createStandupData(teamId);
 
     const { status, data } = await api('GET', `/api/${teamId}/trends/standups?days=30`);
 
@@ -339,7 +370,7 @@ test.describe('Trends API', () => {
 
   test('GET /api/:teamId/trends/team returns team overview statistics', async () => {
     const teamId = createTeamInDb('Trends Test Team 2', ['Charlie', 'Dave']);
-    await createStandupData(teamId, ['Charlie', 'Dave']);
+    await createStandupData(teamId);
 
     const { status, data } = await api('GET', `/api/${teamId}/trends/team?days=30`);
 
@@ -355,7 +386,7 @@ test.describe('Trends API', () => {
 
   test('GET /api/:teamId/trends/members returns member statistics', async () => {
     const teamId = createTeamInDb('Trends Test Team 3', ['Eve', 'Frank']);
-    await createStandupData(teamId, ['Eve', 'Frank']);
+    await createStandupData(teamId);
 
     const { status, data } = await api('GET', `/api/${teamId}/trends/members?days=30`);
 
@@ -366,13 +397,13 @@ test.describe('Trends API', () => {
     expect(data).toHaveProperty('trends');
 
     expect(data.members.length).toBe(2);
-    expect(data.members.map((m: any) => m.memberName)).toContain('Eve');
-    expect(data.members.map((m: any) => m.memberName)).toContain('Frank');
+    expect(data.members.map((m: { memberName: string }) => m.memberName)).toContain('Eve');
+    expect(data.members.map((m: { memberName: string }) => m.memberName)).toContain('Frank');
   });
 
   test('trends respect days query parameter', async () => {
     const teamId = createTeamInDb('Trends Test Team 4', ['Grace']);
-    await createStandupData(teamId, ['Grace']);
+    await createStandupData(teamId);
 
     // 7-day trends should return data
     const { data: sevenDays } = await api('GET', `/api/${teamId}/trends/team?days=7`);

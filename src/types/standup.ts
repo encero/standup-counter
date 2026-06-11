@@ -17,6 +17,13 @@ export interface SpeakerSession {
   pausedDuration: number;
 }
 
+export interface SyncNote {
+  id: string;
+  text: string;
+  standupId: string;
+  createdAt: number;
+}
+
 export interface StandupState {
   teamMembers: TeamMember[];
   currentSpeaker: TeamMember | null;

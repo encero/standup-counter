@@ -4,6 +4,7 @@
  */
 import { ChildProcess, spawn } from 'child_process';
 import Database from 'better-sqlite3';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -33,7 +34,6 @@ export function generateTeamId(): string {
 export function createTestDatabase(): Database.Database {
   // Remove existing test database
   try {
-    const fs = require('fs');
     if (fs.existsSync(TEST_DB_PATH)) {
       fs.unlinkSync(TEST_DB_PATH);
     }
@@ -268,7 +268,6 @@ export async function waitForServer(maxRetries = 20): Promise<void> {
  */
 export function cleanupTestDatabase(): void {
   try {
-    const fs = require('fs');
     if (fs.existsSync(TEST_DB_PATH)) {
       fs.unlinkSync(TEST_DB_PATH);
     }

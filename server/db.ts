@@ -162,6 +162,26 @@ function runMigrations() {
     db.prepare("INSERT INTO _migrations (name) VALUES (?)").run('005_add_expected_seconds');
   }
 
+  // Migration 006: Add sync_notes table (post-standup "sync"/parking-lot items)
+  if (!appliedMigrations.has('006_add_sync_notes')) {
+    console.log('📦 Running migration 006: Adding sync_notes table...');
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS sync_notes (
+        id TEXT PRIMARY KEY,
+        team_id TEXT NOT NULL,
+        standup_id TEXT NOT NULL,
+        text TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_sync_notes_team_id ON sync_notes(team_id);
+      CREATE INDEX IF NOT EXISTS idx_sync_notes_standup_id ON sync_notes(standup_id);
+    `);
+
+    db.prepare("INSERT INTO _migrations (name) VALUES (?)").run('006_add_sync_notes');
+  }
+
   console.log('✅ Database migrations complete');
 }
 

@@ -38,6 +38,14 @@ if (process.env.NODE_ENV === 'production') {
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
+// Post-standup "sync" / parking-lot note
+interface SyncNote {
+  id: string;
+  text: string;
+  standupId: string;
+  createdAt: number;
+}
+
 // Timer state per team
 interface TimerState {
   currentSpeaker: { id: string; name: string; isGuest?: boolean } | null;
@@ -48,6 +56,7 @@ interface TimerState {
   startTime: number | null;
   totalPaused: number;
   pauseStart: number | null;
+  syncNotes: SyncNote[];
 }
 
 const defaultTimerState = (): TimerState => ({
@@ -59,7 +68,11 @@ const defaultTimerState = (): TimerState => ({
   startTime: null,
   totalPaused: 0,
   pauseStart: null,
+  syncNotes: [],
 });
+
+const MAX_NOTE_LENGTH = 500;
+const MAX_NOTES_PER_STANDUP = 100;
 
 // Per-team timer states
 const teamTimerStates = new Map<string, TimerState>();
@@ -137,7 +150,8 @@ wss.on('connection', (ws, req) => {
 
       switch (msg.type) {
         case 'start':
-          if (timerState.status === 'idle') {
+          // Reuse a standupId already created by an early sync note; otherwise mint one.
+          if (!timerState.standupId) {
             timerState.standupId = crypto.randomUUID();
           }
           timerState.currentSpeaker = msg.speaker;
@@ -169,9 +183,13 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'stop':
-          // Broadcast end_standup with the standupId before resetting
+          // Broadcast end_standup with the standupId + any sync notes before resetting
           if (timerState.standupId) {
-            broadcastToTeam(teamId, { type: 'end_standup', standupId: timerState.standupId });
+            broadcastToTeam(teamId, {
+              type: 'end_standup',
+              standupId: timerState.standupId,
+              syncNotes: timerState.syncNotes,
+            });
           }
           timerState.currentSpeaker = null;
           timerState.standupId = null;
@@ -181,8 +199,47 @@ wss.on('connection', (ws, req) => {
           timerState.startTime = null;
           timerState.totalPaused = 0;
           timerState.pauseStart = null;
+          timerState.syncNotes = [];
           broadcastToTeam(teamId, { type: 'state', ...timerState });
           break;
+
+        case 'add_note': {
+          const text = typeof msg.text === 'string' ? msg.text.trim().slice(0, MAX_NOTE_LENGTH) : '';
+          if (!text || timerState.syncNotes.length >= MAX_NOTES_PER_STANDUP) break;
+          // A note can be jotted before the first speaker — mint a standupId so it has a home.
+          if (!timerState.standupId) {
+            timerState.standupId = crypto.randomUUID();
+          }
+          const note: SyncNote = {
+            id: crypto.randomUUID(),
+            text,
+            standupId: timerState.standupId,
+            createdAt: Date.now(),
+          };
+          timerState.syncNotes.push(note);
+          db.prepare(
+            'INSERT INTO sync_notes (id, team_id, standup_id, text, created_at) VALUES (?, ?, ?, ?, ?)'
+          ).run(note.id, teamId, note.standupId, note.text, note.createdAt);
+          broadcastToTeam(teamId, {
+            type: 'notes',
+            standupId: timerState.standupId,
+            syncNotes: timerState.syncNotes,
+          });
+          break;
+        }
+
+        case 'remove_note': {
+          const noteId = typeof msg.id === 'string' ? msg.id : '';
+          if (!noteId) break;
+          timerState.syncNotes = timerState.syncNotes.filter(n => n.id !== noteId);
+          db.prepare('DELETE FROM sync_notes WHERE id = ? AND team_id = ?').run(noteId, teamId);
+          broadcastToTeam(teamId, {
+            type: 'notes',
+            standupId: timerState.standupId,
+            syncNotes: timerState.syncNotes,
+          });
+          break;
+        }
 
         case 'getState':
           ws.send(JSON.stringify({ type: 'state', ...timerState }));
@@ -264,8 +321,8 @@ teamRouter.get('/members', (req, res) => {
   const { teamId } = req.params;
   const members = db.prepare(`
     SELECT id, name, avatar, is_guest as isGuest FROM team_members WHERE team_id = ? ORDER BY created_at
-  `).all(teamId);
-  res.json(members.map((m: any) => ({ ...m, isGuest: Boolean(m.isGuest) })));
+  `).all(teamId) as Array<{ id: string; name: string; avatar: string | null; isGuest: number }>;
+  res.json(members.map(m => ({ ...m, isGuest: Boolean(m.isGuest) })));
 });
 
 teamRouter.post('/members', (req, res) => {
@@ -329,6 +386,21 @@ teamRouter.delete('/sessions', (req, res) => {
   db.prepare('DELETE FROM sessions WHERE team_id = ?').run(teamId);
   db.prepare('DELETE FROM standups WHERE team_id = ?').run(teamId);
   res.json({ success: true });
+});
+
+// Sync notes endpoint - persisted parking-lot items for a given standup
+teamRouter.get('/notes', (req, res) => {
+  const { teamId } = req.params;
+  const standupId = req.query.standupId as string | undefined;
+  if (!standupId) {
+    res.json([]);
+    return;
+  }
+  const notes = db.prepare(`
+    SELECT id, text, standup_id as standupId, created_at as createdAt
+    FROM sync_notes WHERE team_id = ? AND standup_id = ? ORDER BY created_at ASC
+  `).all(teamId, standupId);
+  res.json(notes);
 });
 
 // Trends endpoints

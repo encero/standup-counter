@@ -6,9 +6,10 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
+import { Pin, ChevronRight } from 'lucide-react';
 import { Sparkline, TrendArrow } from '@/components/shared/Sparkline';
 import { StockTicker } from '@/components/StockTicker';
-import type { SpeakerSession, TeamMember } from '@/types/standup';
+import type { SpeakerSession, SyncNote, TeamMember } from '@/types/standup';
 import { cn } from '@/lib/utils';
 
 const API_BASE = import.meta.env.PROD ? '' : 'http://localhost:3001';
@@ -42,6 +43,8 @@ interface StandupSummaryProps {
 export function StandupSummary({ open, onClose, sessions, teamMembers, teamId, standupId, formatTime }: StandupSummaryProps) {
   const [teamTrends, setTeamTrends] = useState<TeamTrends | null>(null);
   const [memberTrends, setMemberTrends] = useState<MemberTrends | null>(null);
+  const [notes, setNotes] = useState<SyncNote[]>([]);
+  const [notesExpanded, setNotesExpanded] = useState(false);
 
   const API_URL = `${API_BASE}/api/${teamId}`;
 
@@ -57,6 +60,18 @@ export function StandupSummary({ open, onClose, sessions, teamMembers, teamId, s
       }).catch(console.error);
     }
   }, [open, teamId, API_URL]);
+
+  // Fetch the standup's parked sync notes (empty until the fetch resolves so a
+  // prior standup's notes never linger across opens)
+  useEffect(() => {
+    if (!open || !teamId || !standupId) return;
+    let cancelled = false;
+    fetch(`${API_URL}/notes?standupId=${standupId}`)
+      .then(r => r.json())
+      .then((data: SyncNote[]) => { if (!cancelled) setNotes(Array.isArray(data) ? data : []); })
+      .catch(console.error);
+    return () => { cancelled = true; };
+  }, [open, teamId, standupId, API_URL]);
 
   // Get current standup sessions only
   const standupSessions = standupId
@@ -118,6 +133,37 @@ export function StandupSummary({ open, onClose, sessions, teamMembers, teamId, s
               <div className="text-xs text-muted-foreground">Avg/Person</div>
             </div>
           </div>
+
+          {/* Sync / parking-lot notes captured during standup - collapsed by default */}
+          {notes.length > 0 && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50/60 p-3 dark:border-amber-900/50 dark:bg-amber-950/20">
+              <button
+                type="button"
+                onClick={() => setNotesExpanded(v => !v)}
+                aria-expanded={notesExpanded}
+                className="flex w-full items-center gap-1.5 text-xs font-medium text-amber-700 dark:text-amber-400"
+              >
+                <Pin className="h-3.5 w-3.5 shrink-0" />
+                <span>Sync after standup ({notes.length})</span>
+                <ChevronRight
+                  className={cn(
+                    "ml-auto h-3.5 w-3.5 shrink-0 transition-transform",
+                    notesExpanded && "rotate-90"
+                  )}
+                />
+              </button>
+              {notesExpanded && (
+                <ul className="mt-2 space-y-1.5">
+                  {notes.map((note) => (
+                    <li key={note.id} className="flex items-start gap-2 text-sm">
+                      <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-amber-500" />
+                      <span className="flex-1 break-words whitespace-pre-wrap leading-snug">{note.text}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
 
           {/* Comparison to averages */}
           {(dayAvg > 0 || overallAvg > 0) && (

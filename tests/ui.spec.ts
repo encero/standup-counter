@@ -2,8 +2,8 @@
  * UI Behavior Tests
  * End-to-end browser tests for complete user flows
  */
-import { test, expect, type Page } from '@playwright/test';
-import { generateTeamId, TEST_DB_PATH, BASE_URL } from './test-helpers';
+import { test, expect } from '@playwright/test';
+import { generateTeamId, TEST_DB_PATH } from './test-helpers';
 import Database from 'better-sqlite3';
 
 // Helper to create a team directly in the database
@@ -25,7 +25,7 @@ function createTeamInDb(name: string, members: string[] = []): string {
 // Helper to create standup data for trends testing
 function createStandupData(teamId: string) {
   const db = new Database(TEST_DB_PATH);
-  const members = db.prepare('SELECT id, name FROM team_members WHERE team_id = ?').all(teamId) as any[];
+  const members = db.prepare('SELECT id, name FROM team_members WHERE team_id = ?').all(teamId) as Array<{ id: string; name: string }>;
   
   const now = Date.now();
   
@@ -189,6 +189,84 @@ test.describe('Standup Timer Page', () => {
     // Switch to Henry
     await page.getByRole('button', { name: /Henry/ }).click();
     await expect(page.getByText('Henry is speaking')).toBeVisible({ timeout: 10000 });
+  });
+});
+
+test.describe('Sync Notes (UI)', () => {
+  test('adding a topic from the main view shows it in the panel', async ({ page }) => {
+    const teamId = createTeamInDb('Sync Add Team', ['Alice']);
+    await page.goto(`/${teamId}`);
+
+    await expect(page.getByText('Alice')).toBeVisible();
+    await page.waitForTimeout(500); // wait for WebSocket to connect
+
+    const input = page.getByPlaceholder(/add a topic/i);
+    await expect(input).toBeEnabled({ timeout: 10000 });
+    await input.fill('Discuss release plan');
+    await input.press('Enter');
+
+    // The note appears in the live panel and the count badge shows 1
+    await expect(page.getByText('Discuss release plan')).toBeVisible({ timeout: 5000 });
+    await expect(input).toHaveValue(''); // input cleared, ready for the next note
+  });
+
+  test('ending a standup with topics shows the sync review and collapses discussed topics', async ({ page }) => {
+    const teamId = createTeamInDb('Sync Review Team', ['Bob']);
+    await page.goto(`/${teamId}`);
+
+    await expect(page.getByText('Bob')).toBeVisible();
+    await page.waitForTimeout(500);
+
+    const input = page.getByPlaceholder(/add a topic/i);
+    await expect(input).toBeEnabled({ timeout: 10000 });
+    await input.fill('Talk about CI');
+    await input.press('Enter');
+    await expect(page.getByText('Talk about CI')).toBeVisible({ timeout: 5000 });
+
+    // End Standup becomes available once a topic is parked
+    const endButton = page.getByRole('button', { name: 'End Standup' });
+    await expect(endButton).toBeEnabled({ timeout: 5000 });
+    await endButton.click();
+
+    // Review dialog lists the topic with progress
+    await expect(page.getByText('Time to sync')).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText(/0\/1 discussed/)).toBeVisible();
+
+    // Tapping the topic marks it discussed / collapsed
+    await page.getByRole('button', { name: /Talk about CI/ }).click();
+    await expect(page.getByText(/All 1 topic discussed/)).toBeVisible({ timeout: 5000 });
+
+    // Continue into the usual summary
+    await page.getByRole('button', { name: /View summary/ }).click();
+    await expect(page.getByText('Standup Complete')).toBeVisible({ timeout: 5000 });
+  });
+
+  test('summary shows sync topics collapsed by default and expandable', async ({ page }) => {
+    const teamId = createTeamInDb('Sync Summary Team', ['Carol']);
+    await page.goto(`/${teamId}`);
+
+    await expect(page.getByText('Carol')).toBeVisible();
+    await page.waitForTimeout(500);
+
+    const input = page.getByPlaceholder(/add a topic/i);
+    await expect(input).toBeEnabled({ timeout: 10000 });
+    await input.fill('Review on-call rotation');
+    await input.press('Enter');
+    await expect(page.getByText('Review on-call rotation')).toBeVisible({ timeout: 5000 });
+
+    await page.getByRole('button', { name: 'End Standup' }).click();
+    // Skip the review dialog straight to the summary
+    await page.getByRole('button', { name: /View summary/ }).click();
+    await expect(page.getByText('Standup Complete')).toBeVisible({ timeout: 5000 });
+
+    // The notes section is present but collapsed - topic text hidden behind the toggle
+    const notesToggle = page.getByRole('button', { name: /Sync after standup/ });
+    await expect(notesToggle).toBeVisible();
+    await expect(page.getByText('Review on-call rotation')).toBeHidden();
+
+    // Expanding reveals the topic
+    await notesToggle.click();
+    await expect(page.getByText('Review on-call rotation')).toBeVisible();
   });
 });
 
