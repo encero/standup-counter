@@ -104,14 +104,13 @@ interface SyncNotesDialogProps {
   open: boolean;
   notes: SyncNote[];
   onContinue: () => void;
-  onClose: () => void;
 }
 
 /**
  * Review dialog shown when a standup ends and there are sync notes. Lists the
- * parking-lot items, then offers a transition into the usual summary screen.
+ * parking-lot items; dismissing it (any way) always advances to the summary.
  */
-export function SyncNotesDialog({ open, notes, onContinue, onClose }: SyncNotesDialogProps) {
+export function SyncNotesDialog({ open, notes, onContinue }: SyncNotesDialogProps) {
   // Moderator marks topics as discussed; completed ones collapse to the bottom.
   // New standups carry fresh note ids, so stale ids here are harmless.
   const [completed, setCompleted] = useState<Set<string>>(new Set());
@@ -127,7 +126,7 @@ export function SyncNotesDialog({ open, notes, onContinue, onClose }: SyncNotesD
   const allDone = ordered.length > 0 && active.length === 0;
 
   return (
-    <Dialog open={open} onOpenChange={(o) => { if (!o) onClose(); }}>
+    <Dialog open={open} onOpenChange={(o) => { if (!o) onContinue(); }}>
       <DialogContent className="sm:max-w-md">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
@@ -174,7 +173,6 @@ export function SyncNotesDialog({ open, notes, onContinue, onClose }: SyncNotesD
         </ul>
 
         <DialogFooter>
-          <Button variant="outline" onClick={onClose}>Close</Button>
           <Button onClick={onContinue}>
             View summary
             <ArrowRight className="h-4 w-4" data-icon="inline-end" />

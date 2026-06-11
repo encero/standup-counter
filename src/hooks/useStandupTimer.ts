@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ConnectionManager, type ConnectionStatus } from '@/lib/ConnectionManager';
-import type { TeamMember, SpeakerSession, SyncNote, TimerStatus } from '@/types/standup';
+import type { TeamMember, SpeakerSession, SyncNote, TimerStatus, SprintStatus } from '@/types/standup';
 
 export type { ConnectionStatus };
 
@@ -43,6 +43,16 @@ export function useStandupTimer(teamId: string) {
   const [syncNotes, setSyncNotes] = useState<SyncNote[]>([]);
   const [endedStandupNotes, setEndedStandupNotes] = useState<SyncNote[]>([]);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting');
+  const [sprintStatus, setSprintStatus] = useState<SprintStatus | null>(null);
+
+  // Sprint goal status is DB-backed (not part of the in-memory timer state), so
+  // fetch a snapshot on load; live edits arrive via the 'sprint' WS broadcast.
+  useEffect(() => {
+    if (!teamId) return;
+    ConnectionManager.get<SprintStatus>(`${API_URL}/sprint`)
+      .then(setSprintStatus)
+      .catch(err => console.error('Failed to load sprint status:', err));
+  }, [teamId, API_URL]);
 
   const startTimeRef = useRef<number | null>(null);
   const pauseStartRef = useRef<number | null>(null);
@@ -173,6 +183,9 @@ export function useStandupTimer(teamId: string) {
         // Standup was ended (possibly from control page) - trigger summary
         setEndedStandupNotes((msg.syncNotes as SyncNote[]) ?? []);
         setEndedStandupId(msg.standupId as string);
+      } else if (msg.type === 'sprint') {
+        // Sprint goal config/done changed (possibly from another client)
+        setSprintStatus(msg.sprint as SprintStatus);
       }
     });
 
@@ -264,6 +277,22 @@ export function useStandupTimer(teamId: string) {
     wsSend({ type: 'remove_note', id });
   }, [wsSend]);
 
+  // Update sprint config and/or the done flag. The PUT response is the freshly
+  // computed status; the server also broadcasts it to every other client.
+  const updateSprint = useCallback((patch: {
+    goal?: string;
+    startDate?: string;
+    lengthDays?: number;
+    done?: boolean;
+    thresholds?: { notice: number; warning: number; critical: number };
+  }) => {
+    return ConnectionManager.put<SprintStatus>(`${API_URL}/sprint`, patch)
+      .then(status => { setSprintStatus(status); return status; })
+      .catch(err => { console.error('Failed to update sprint:', err); throw err; });
+  }, [API_URL]);
+
+  const markGoalDone = useCallback((done = true) => updateSprint({ done }), [updateSprint]);
+
   const clearSessions = useCallback(() => {
     setSessions([]);
     // Clear from SQLite via ConnectionManager
@@ -296,6 +325,9 @@ export function useStandupTimer(teamId: string) {
     interruptions,
     isLoading,
     connectionStatus,
+    sprintStatus,
+    updateSprint,
+    markGoalDone,
     startTimer,
     pauseTimer,
     resumeTimer,

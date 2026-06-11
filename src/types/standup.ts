@@ -37,3 +37,24 @@ export interface StandupState {
 }
 
 export type TimerStatus = 'idle' | 'running' | 'paused';
+
+// Days-remaining cutoffs at which each urgency level kicks in (notice > warning > critical).
+export interface SprintThresholds {
+  notice: number;
+  warning: number;
+  critical: number;
+}
+
+export interface SprintStatus {
+  configured: boolean;
+  goal: string;
+  hasGoal: boolean;
+  lengthDays: number;
+  startDate: string;
+  sprintStart: number;
+  sprintEnd: number;
+  elapsedFraction: number;
+  daysRemaining: number;
+  done: boolean;
+  thresholds: SprintThresholds;
+}

@@ -11,6 +11,7 @@ import { RadialIndicator, LinearIndicator } from '@/components/shared/TimeIndica
 import { Settings } from '@/components/Settings';
 import { StandupSummary } from '@/components/StandupSummary';
 import { SyncNotesPanel, SyncNotesDialog } from '@/components/SyncNotes';
+import { SprintGoalBanner, SprintGoalDialog } from '@/components/SprintGoal';
 import type { SyncNote } from '@/types/standup';
 import { cn } from '@/lib/utils';
 
@@ -21,7 +22,7 @@ export function StandupTimer() {
     teamId, teamMembers, sessions, currentSpeaker, currentStandupId, status, elapsedTime, interruptions,
     endedStandupId, syncNotes, endedStandupNotes, connectionStatus, startTimer, pauseTimer, resumeTimer,
     stopTimer, addMember, removeMember, addSyncNote, removeSyncNote, clearSessions, clearEndedStandupId,
-    formatTime,
+    sprintStatus, updateSprint, markGoalDone, formatTime,
   } = useStandup();
 
   // Disconnected/reconnecting are surfaced immediately; a transient 'connecting'
@@ -46,6 +47,7 @@ export function StandupTimer() {
   const [summaryStandupId, setSummaryStandupId] = useState<string | null>(null);
   const [showNotesReview, setShowNotesReview] = useState(false);
   const [reviewNotes, setReviewNotes] = useState<SyncNote[]>([]);
+  const [showGoalCheck, setShowGoalCheck] = useState(false);
   const expectedMs = expectedSeconds * 1000;
 
   // Below Tailwind's md breakpoint (sidebar widths) we render a compact linear
@@ -57,16 +59,43 @@ export function StandupTimer() {
   // clicked End Standup), so route both local and remote ends through here and
   // dedupe by standup id to avoid re-opening dialogs the user already dismissed.
   const handledEndRef = useRef<string | null>(null);
-  const beginEndFlow = (standupId: string | null, notes: SyncNote[]) => {
-    if (standupId && handledEndRef.current === standupId) return;
-    handledEndRef.current = standupId;
-    setSummaryStandupId(standupId);
+  // Notes parked until the sprint-goal check is answered (it precedes the sync review).
+  const pendingNotesRef = useRef<SyncNote[]>([]);
+
+  // After the goal check (or when it's skipped), continue to the sync-notes
+  // review if there are parked topics, otherwise straight to the summary.
+  const proceedAfterGoal = (notes: SyncNote[]) => {
     if (notes.length > 0) {
       setReviewNotes(notes);
       setShowNotesReview(true);
     } else {
       setShowSummary(true);
     }
+  };
+
+  const beginEndFlow = (standupId: string | null, notes: SyncNote[]) => {
+    if (standupId && handledEndRef.current === standupId) return;
+    handledEndRef.current = standupId;
+    setSummaryStandupId(standupId);
+    // Ask whether the sprint goal is done first — but only when a goal is set and
+    // isn't already marked done for this sprint.
+    if (sprintStatus?.hasGoal && !sprintStatus.done) {
+      pendingNotesRef.current = notes;
+      setShowGoalCheck(true);
+    } else {
+      proceedAfterGoal(notes);
+    }
+  };
+
+  const handleGoalDone = () => {
+    markGoalDone(true).catch(() => { /* surfaced via console in the hook */ });
+    setShowGoalCheck(false);
+    proceedAfterGoal(pendingNotesRef.current);
+  };
+
+  const handleGoalNotDone = () => {
+    setShowGoalCheck(false);
+    proceedAfterGoal(pendingNotesRef.current);
   };
 
   // Standup ended (locally or from the control page) - review notes, then summary.
@@ -181,10 +210,15 @@ export function StandupTimer() {
               onAddMember={addMember}
               onRemoveMember={removeMember}
               onClearSessions={clearSessions}
+              sprintStatus={sprintStatus}
+              onUpdateSprint={updateSprint}
               disabled={status !== 'idle'}
             />
           </div>
         </div>
+
+        {/* Sprint Goal — escalating signal of how close the team is to the goal */}
+        <SprintGoalBanner status={sprintStatus} />
 
         {/* Timer Card — compact linear header on narrow/sidebar widths,
             full radial dial on wider screens. */}
@@ -290,17 +324,21 @@ export function StandupTimer() {
         />
       </div>
 
-      {/* Sync Notes Review - shown first when a standup ends with parked topics */}
+      {/* Sprint goal check - shown first when a standup ends with an unmet goal */}
+      <SprintGoalDialog
+        open={showGoalCheck}
+        status={sprintStatus}
+        onDone={handleGoalDone}
+        onNotDone={handleGoalNotDone}
+      />
+
+      {/* Sync Notes Review - shown when a standup ends with parked topics */}
       <SyncNotesDialog
         open={showNotesReview}
         notes={reviewNotes}
         onContinue={() => {
           setShowNotesReview(false);
           setShowSummary(true);
-        }}
-        onClose={() => {
-          setShowNotesReview(false);
-          handledEndRef.current = null;
         }}
       />
 

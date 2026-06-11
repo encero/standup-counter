@@ -22,6 +22,24 @@ function createTeamInDb(name: string, members: string[] = []): string {
   return teamId;
 }
 
+// Helper to configure a team's sprint goal directly in the database. The sprint_*
+// columns are added by migration 007 when the test server boots, so they exist by
+// the time these UI tests run.
+function configureSprintInDb(
+  teamId: string,
+  opts: { goal: string; startDaysAgo: number; lengthDays?: number; thresholds?: string; doneAt?: number | null }
+): void {
+  const db = new Database(TEST_DB_PATH);
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - opts.startDaysAgo);
+  const startDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  db.prepare(
+    `UPDATE teams SET sprint_goal = ?, sprint_start = ?, sprint_length_days = ?, sprint_thresholds = ?, sprint_goal_done_at = ? WHERE id = ?`
+  ).run(opts.goal, startDate, opts.lengthDays ?? 14, opts.thresholds ?? '7,3,1', opts.doneAt ?? null, teamId);
+  db.close();
+}
+
 // Helper to create standup data for trends testing
 function createStandupData(teamId: string) {
   const db = new Database(TEST_DB_PATH);
@@ -541,5 +559,131 @@ test.describe('Session Duration Regression', () => {
     const charlieDuration = sessions[0].duration;
     expect(charlieDuration).toBeGreaterThan(1500);
     expect(charlieDuration).toBeLessThan(3500);
+  });
+});
+
+test.describe('Sprint Goal', () => {
+  test('no banner is shown when no sprint goal is configured', async ({ page }) => {
+    const teamId = createTeamInDb('No Goal Team', ['Alice']);
+    await page.goto(`/${teamId}`);
+
+    await expect(page.getByText('Alice')).toBeVisible();
+    await page.waitForTimeout(500);
+
+    // None of the sprint banner states should appear.
+    await expect(page.getByText(/Sprint goal in progress/)).toHaveCount(0);
+    await expect(page.getByText(/the goal is NOT done/)).toHaveCount(0);
+    await expect(page.getByText(/Sprint goal complete/)).toHaveCount(0);
+  });
+
+  test('calm banner shows the goal early in the sprint', async ({ page }) => {
+    const teamId = createTeamInDb('Calm Sprint Team', ['Alice']);
+    // Day 0 of a 14-day sprint => 14 days left, well above the notice threshold (7).
+    configureSprintInDb(teamId, { goal: 'Ship checkout v2', startDaysAgo: 0, lengthDays: 14 });
+    await page.goto(`/${teamId}`);
+
+    await expect(page.getByText('Sprint goal in progress')).toBeVisible({ timeout: 10000 });
+    await expect(page.getByText('Ship checkout v2')).toBeVisible();
+    await expect(page.getByText('14 days left')).toBeVisible();
+  });
+
+  test('banner escalates to an aggressive critical alert on the last day', async ({ page }) => {
+    const teamId = createTeamInDb('Critical Sprint Team', ['Alice']);
+    // Day 13 of a 14-day sprint => 1 day left => critical (<= threshold 1).
+    configureSprintInDb(teamId, { goal: 'Cut the release', startDaysAgo: 13, lengthDays: 14 });
+    await page.goto(`/${teamId}`);
+
+    const alert = page.getByRole('alert');
+    await expect(alert).toBeVisible({ timeout: 10000 });
+    await expect(alert).toContainText('the goal is STILL not done');
+    await expect(alert).toContainText('Cut the release');
+    await expect(page.getByText('Last day')).toBeVisible();
+    // The critical level applies the angry shake animation.
+    await expect(alert).toHaveClass(/animate-angry-shake/);
+  });
+
+  test('end-of-standup goal check appears before the sync review and "Not yet" continues', async ({ page }) => {
+    const teamId = createTeamInDb('Goal Check Team', ['Bob']);
+    configureSprintInDb(teamId, { goal: 'Finish the audit', startDaysAgo: 13, lengthDays: 14 });
+    await page.goto(`/${teamId}`);
+
+    await expect(page.getByText('Bob')).toBeVisible();
+    await page.waitForTimeout(500);
+
+    // Park a topic so the standup can be ended and a sync review exists.
+    const input = page.getByPlaceholder(/add a topic/i);
+    await expect(input).toBeEnabled({ timeout: 10000 });
+    await input.fill('Discuss flaky test');
+    await input.press('Enter');
+    await expect(page.getByText('Discuss flaky test')).toBeVisible({ timeout: 5000 });
+
+    await page.getByRole('button', { name: 'End Standup' }).click();
+
+    // Goal check comes FIRST — before the sync review.
+    await expect(page.getByText('Sprint goal check')).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText('Time to sync')).toHaveCount(0);
+
+    await page.getByRole('button', { name: /Not yet/ }).click();
+
+    // Then the sync review, then the summary.
+    await expect(page.getByText('Time to sync')).toBeVisible({ timeout: 5000 });
+    await page.getByRole('button', { name: /View summary/ }).click();
+    await expect(page.getByText('Standup Complete')).toBeVisible({ timeout: 5000 });
+  });
+
+  test('answering "Yes — it\'s done!" marks the goal done and flips the banner to complete', async ({ page }) => {
+    const teamId = createTeamInDb('Goal Done Team', ['Bob']);
+    configureSprintInDb(teamId, { goal: 'Land the migration', startDaysAgo: 5, lengthDays: 14 });
+    await page.goto(`/${teamId}`);
+
+    await expect(page.getByText('Bob')).toBeVisible();
+    await page.waitForTimeout(500);
+
+    const input = page.getByPlaceholder(/add a topic/i);
+    await expect(input).toBeEnabled({ timeout: 10000 });
+    await input.fill('Parking lot item');
+    await input.press('Enter');
+    await expect(page.getByText('Parking lot item')).toBeVisible({ timeout: 5000 });
+
+    await page.getByRole('button', { name: 'End Standup' }).click();
+
+    await expect(page.getByText('Sprint goal check')).toBeVisible({ timeout: 5000 });
+    await page.getByRole('button', { name: /Yes — it's done/ }).click();
+
+    // Flow continues to the sync review then summary; close them out.
+    await expect(page.getByText('Time to sync')).toBeVisible({ timeout: 5000 });
+    await page.getByRole('button', { name: /View summary/ }).click();
+    await expect(page.getByText('Standup Complete')).toBeVisible({ timeout: 5000 });
+    await page.keyboard.press('Escape');
+
+    // Banner now reflects the completed goal (synced live via the sprint broadcast).
+    await expect(page.getByText('Sprint goal complete 🎉')).toBeVisible({ timeout: 5000 });
+
+    // And the done flag is persisted.
+    const db = new Database(TEST_DB_PATH);
+    const row = db.prepare('SELECT sprint_goal_done_at FROM teams WHERE id = ?').get(teamId) as { sprint_goal_done_at: number | null };
+    db.close();
+    expect(row.sprint_goal_done_at).not.toBeNull();
+  });
+
+  test('goal check is skipped when the goal is already marked done', async ({ page }) => {
+    const teamId = createTeamInDb('Already Done Team', ['Bob']);
+    configureSprintInDb(teamId, { goal: 'Done already', startDaysAgo: 2, lengthDays: 14, doneAt: Date.now() });
+    await page.goto(`/${teamId}`);
+
+    // Banner is in the completed state.
+    await expect(page.getByText('Sprint goal complete 🎉')).toBeVisible({ timeout: 10000 });
+
+    const input = page.getByPlaceholder(/add a topic/i);
+    await expect(input).toBeEnabled({ timeout: 10000 });
+    await input.fill('A topic');
+    await input.press('Enter');
+    await expect(page.getByText('A topic')).toBeVisible({ timeout: 5000 });
+
+    await page.getByRole('button', { name: 'End Standup' }).click();
+
+    // No goal check — straight to the sync review.
+    await expect(page.getByText('Time to sync')).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText('Sprint goal check')).toHaveCount(0);
   });
 });

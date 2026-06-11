@@ -312,6 +312,95 @@ function updateStandupAggregate(standupId: string, teamId: string) {
   }
 }
 
+// --- Sprint goal tracking ---------------------------------------------------
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+interface SprintStatus {
+  configured: boolean;      // a valid start date + interval is set
+  goal: string;             // free-text goal description
+  hasGoal: boolean;         // goal text is non-empty
+  lengthDays: number;       // sprint interval in calendar days
+  startDate: string;        // raw 'YYYY-MM-DD' anchor from config
+  sprintStart: number;      // ms — start of the CURRENT sprint window
+  sprintEnd: number;        // ms — end of the current window (exclusive)
+  elapsedFraction: number;  // 0..1 progress through the current window
+  daysRemaining: number;    // whole calendar days left in the window
+  done: boolean;            // goal marked done within the current window
+  thresholds: SprintThresholds; // days-remaining cutoffs for each urgency level
+}
+
+// Day counts at which each urgency level kicks in: a level triggers once the
+// sprint has `daysRemaining <= threshold` days left. notice triggers earliest
+// (most days left), critical latest, so notice > warning > critical >= 1.
+interface SprintThresholds {
+  notice: number;   // calm -> notice
+  warning: number;  // notice -> warning
+  critical: number; // warning -> critical
+}
+
+const DEFAULT_THRESHOLDS: SprintThresholds = { notice: 7, warning: 3, critical: 1 };
+
+// Parse "7,3,1" into descending day counts, falling back to defaults on any
+// malformed/out-of-order/out-of-range input so the client always gets sane cutoffs.
+function parseThresholds(raw: string | null | undefined): SprintThresholds {
+  const parts = (raw || '').split(',').map(s => Number(s.trim()));
+  if (parts.length !== 3 || parts.some(n => !Number.isInteger(n) || n < 1 || n > 365)) {
+    return DEFAULT_THRESHOLDS;
+  }
+  const [notice, warning, critical] = parts;
+  if (!(notice > warning && warning > critical)) return DEFAULT_THRESHOLDS;
+  return { notice, warning, critical };
+}
+
+// Derive the current sprint window by repeating the interval from the anchor
+// date. "done" is stored as a timestamp and only counts for the window it falls
+// in, so it auto-resets each new sprint with no scheduled job.
+function computeSprintStatus(teamId: string): SprintStatus {
+  const team = db.prepare(
+    'SELECT sprint_start, sprint_length_days, sprint_goal, sprint_goal_done_at, sprint_thresholds FROM teams WHERE id = ?'
+  ).get(teamId) as {
+    sprint_start: string | null;
+    sprint_length_days: number | null;
+    sprint_goal: string | null;
+    sprint_goal_done_at: number | null;
+    sprint_thresholds: string | null;
+  } | undefined;
+
+  const goal = team?.sprint_goal || '';
+  const hasGoal = goal.trim().length > 0;
+  const startDate = team?.sprint_start || '';
+  const rawLength = team?.sprint_length_days;
+  const lengthDays = Number.isFinite(rawLength) && (rawLength as number) >= 1 ? (rawLength as number) : 14;
+  const doneAt = team?.sprint_goal_done_at ?? null;
+  const thresholds = parseThresholds(team?.sprint_thresholds);
+
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(startDate);
+  if (!m) {
+    return {
+      configured: false, goal, hasGoal, lengthDays, startDate,
+      sprintStart: 0, sprintEnd: 0, elapsedFraction: 0, daysRemaining: 0, done: false, thresholds,
+    };
+  }
+
+  // Local midnight of the anchor date.
+  const anchorMs = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime();
+  const lenMs = lengthDays * DAY_MS;
+  const now = Date.now();
+
+  // Clamp to sprint 0 before the anchor so a future start date doesn't go negative.
+  const index = Math.max(0, Math.floor((now - anchorMs) / lenMs));
+  const sprintStart = anchorMs + index * lenMs;
+  const sprintEnd = sprintStart + lenMs;
+  const elapsedFraction = Math.min(1, Math.max(0, (now - sprintStart) / lenMs));
+  const daysRemaining = Math.max(0, Math.ceil((sprintEnd - now) / DAY_MS));
+  const done = doneAt != null && doneAt >= sprintStart && doneAt < sprintEnd;
+
+  return {
+    configured: true, goal, hasGoal, lengthDays, startDate,
+    sprintStart, sprintEnd, elapsedFraction, daysRemaining, done, thresholds,
+  };
+}
+
 // Version endpoint (no auth required) - lets the client verify it matches the server
 app.get('/api/version', (_req, res) => {
   res.json({ version: APP_VERSION });
@@ -594,6 +683,44 @@ teamRouter.put('/settings', (req, res) => {
     db.prepare('UPDATE teams SET expected_seconds = ? WHERE id = ?').run(expectedSeconds, teamId);
   }
   res.json({ success: true });
+});
+
+// Sprint goal endpoints
+teamRouter.get('/sprint', (req, res) => {
+  res.json(computeSprintStatus(req.params.teamId));
+});
+
+teamRouter.put('/sprint', (req, res) => {
+  const { teamId } = req.params;
+  const { goal, startDate, lengthDays, done, thresholds } = req.body;
+
+  if (goal !== undefined) {
+    db.prepare('UPDATE teams SET sprint_goal = ? WHERE id = ?').run(String(goal).slice(0, 200), teamId);
+  }
+  if (startDate !== undefined) {
+    const v = typeof startDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(startDate) ? startDate : '';
+    db.prepare('UPDATE teams SET sprint_start = ? WHERE id = ?').run(v, teamId);
+  }
+  if (lengthDays !== undefined) {
+    const n = Math.min(60, Math.max(1, Math.round(Number(lengthDays) || 14)));
+    db.prepare('UPDATE teams SET sprint_length_days = ? WHERE id = ?').run(n, teamId);
+  }
+  if (thresholds !== undefined) {
+    // Accept either {notice,warning,critical} or [n,w,c]; persist normalized + validated.
+    const t = Array.isArray(thresholds)
+      ? parseThresholds(thresholds.join(','))
+      : parseThresholds(`${thresholds?.notice},${thresholds?.warning},${thresholds?.critical}`);
+    db.prepare('UPDATE teams SET sprint_thresholds = ? WHERE id = ?')
+      .run(`${t.notice},${t.warning},${t.critical}`, teamId);
+  }
+  if (done !== undefined) {
+    db.prepare('UPDATE teams SET sprint_goal_done_at = ? WHERE id = ?').run(done ? Date.now() : null, teamId);
+  }
+
+  const status = computeSprintStatus(teamId);
+  // Push the new state to every connected client so banners/dialogs update live.
+  broadcastToTeam(teamId, { type: 'sprint', sprint: status });
+  res.json(status);
 });
 
 // Stock quotes endpoint - with 30-day history for charts

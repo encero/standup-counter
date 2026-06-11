@@ -182,6 +182,32 @@ function runMigrations() {
     db.prepare("INSERT INTO _migrations (name) VALUES (?)").run('006_add_sync_notes');
   }
 
+  // Migration 007: Add sprint goal tracking to teams
+  if (!appliedMigrations.has('007_add_sprint_goal')) {
+    console.log('📦 Running migration 007: Adding sprint goal tracking to teams...');
+
+    const columns = db.prepare("PRAGMA table_info(teams)").all() as { name: string }[];
+    const addColumnIfMissing = (name: string, def: string) => {
+      if (!columns.some(c => c.name === name)) {
+        db.exec(`ALTER TABLE teams ADD COLUMN ${name} ${def}`);
+      }
+    };
+
+    // sprint_start: ISO date (YYYY-MM-DD) of a reference sprint start; the current
+    // sprint window is derived by repeating sprint_length_days from this anchor.
+    addColumnIfMissing('sprint_start', "TEXT DEFAULT ''");
+    addColumnIfMissing('sprint_length_days', 'INTEGER DEFAULT 14');
+    addColumnIfMissing('sprint_goal', "TEXT DEFAULT ''");
+    // Unix ms timestamp the goal was last marked done; compared against the current
+    // sprint window so "done" auto-resets each new sprint without a scheduled job.
+    addColumnIfMissing('sprint_goal_done_at', 'INTEGER');
+    // Comma-separated descending day counts at which urgency escalates as the sprint
+    // end nears: notice, warning, critical (each triggers when days-remaining <= it).
+    addColumnIfMissing('sprint_thresholds', "TEXT DEFAULT '7,3,1'");
+
+    db.prepare("INSERT INTO _migrations (name) VALUES (?)").run('007_add_sprint_goal');
+  }
+
   console.log('✅ Database migrations complete');
 }
 

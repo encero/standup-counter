@@ -322,6 +322,71 @@ test.describe('Team Settings API', () => {
   });
 });
 
+test.describe('Sprint Goal API', () => {
+  // A start date N days before today (local), formatted as YYYY-MM-DD.
+  function daysAgoISO(n: number): string {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() - n);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  test('GET /api/:teamId/sprint returns unconfigured defaults', async () => {
+    const teamId = createTeamInDb('Test Team');
+    const { status, data } = await api('GET', `/api/${teamId}/sprint`);
+
+    expect(status).toBe(200);
+    expect(data.configured).toBe(false);
+    expect(data.hasGoal).toBe(false);
+    expect(data.done).toBe(false);
+    expect(data.lengthDays).toBe(14);
+    expect(data.thresholds).toEqual({ notice: 7, warning: 3, critical: 1 });
+  });
+
+  test('PUT /api/:teamId/sprint configures the current sprint window', async () => {
+    const teamId = createTeamInDb('Test Team');
+
+    const { status, data } = await api('PUT', `/api/${teamId}/sprint`, {
+      goal: 'Ship checkout v2',
+      startDate: daysAgoISO(5),
+      lengthDays: 14,
+      thresholds: { notice: 5, warning: 3, critical: 1 },
+    });
+
+    expect(status).toBe(200);
+    expect(data.configured).toBe(true);
+    expect(data.hasGoal).toBe(true);
+    expect(data.goal).toBe('Ship checkout v2');
+    expect(data.daysRemaining).toBe(9); // 14 - 5
+    expect(data.elapsedFraction).toBeGreaterThan(0.3);
+    expect(data.elapsedFraction).toBeLessThan(0.5);
+    expect(data.thresholds).toEqual({ notice: 5, warning: 3, critical: 1 });
+  });
+
+  test('PUT /api/:teamId/sprint toggles the done flag', async () => {
+    const teamId = createTeamInDb('Test Team');
+    await api('PUT', `/api/${teamId}/sprint`, { goal: 'Goal', startDate: daysAgoISO(1), lengthDays: 14 });
+
+    const done = await api('PUT', `/api/${teamId}/sprint`, { done: true });
+    expect(done.data.done).toBe(true);
+
+    const undone = await api('PUT', `/api/${teamId}/sprint`, { done: false });
+    expect(undone.data.done).toBe(false);
+  });
+
+  test('PUT /api/:teamId/sprint rejects malformed thresholds, falling back to defaults', async () => {
+    const teamId = createTeamInDb('Test Team');
+
+    // Ascending day counts are invalid (notice must be the largest) and should be
+    // replaced by the defaults.
+    const { data } = await api('PUT', `/api/${teamId}/sprint`, {
+      thresholds: { notice: 1, warning: 3, critical: 7 },
+    });
+
+    expect(data.thresholds).toEqual({ notice: 7, warning: 3, critical: 1 });
+  });
+});
+
 test.describe('Trends API', () => {
   // Helper to create standup data
   async function createStandupData(teamId: string) {
