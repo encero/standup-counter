@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react';
-import { Settings as SettingsIcon, Trash2 } from 'lucide-react';
+import { Settings as SettingsIcon, Trash2, KeyRound, Copy, Check } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import {
@@ -49,6 +49,14 @@ export function Settings({
   const [newMemberName, setNewMemberName] = useState('');
   const [stockSymbols, setStockSymbols] = useState('');
   const [stockSymbolsSaved, setStockSymbolsSaved] = useState(false);
+
+  // PR publisher ingest token. We only learn whether one EXISTS on load (the
+  // raw value is never returned by the server); a freshly generated token is
+  // held in `prToken` so it can be shown once, right after a reset.
+  const [prTokenConfigured, setPrTokenConfigured] = useState(false);
+  const [prToken, setPrToken] = useState<string | null>(null);
+  const [prTokenCopied, setPrTokenCopied] = useState(false);
+  const [prTokenBusy, setPrTokenBusy] = useState(false);
 
   // Sprint goal draft — seeded from the live status and saved as one block.
   const [sprintGoal, setSprintGoal] = useState('');
@@ -100,15 +108,43 @@ export function Settings({
   // Load settings from server via ConnectionManager
   useEffect(() => {
     if (!teamId) return;
-    ConnectionManager.get<{ stockSymbols?: string; expectedSeconds?: number }>(`/api/${teamId}/settings`)
+    ConnectionManager.get<{ stockSymbols?: string; expectedSeconds?: number; prTokenConfigured?: boolean }>(`/api/${teamId}/settings`)
       .then(data => {
         setStockSymbols(data.stockSymbols || '');
         if (data.expectedSeconds !== undefined) {
           onExpectedSecondsChange(data.expectedSeconds);
         }
+        setPrTokenConfigured(Boolean(data.prTokenConfigured));
       })
       .catch(console.error);
   }, [teamId, onExpectedSecondsChange]);
+
+  // Generate/rotate the publisher ingest token. The server returns the raw
+  // token once; any previously issued token stops working immediately.
+  const handleResetToken = () => {
+    if (prTokenConfigured && !window.confirm('Reset the publisher token? The current token will stop working and the publisher must be reconfigured.')) {
+      return;
+    }
+    setPrTokenBusy(true);
+    ConnectionManager.post<{ token: string }>(`/api/${teamId}/pr-status/token`)
+      .then(({ token }) => {
+        setPrToken(token);
+        setPrTokenConfigured(true);
+        setPrTokenCopied(false);
+      })
+      .catch(console.error)
+      .finally(() => setPrTokenBusy(false));
+  };
+
+  const handleCopyToken = () => {
+    if (!prToken) return;
+    navigator.clipboard?.writeText(prToken)
+      .then(() => {
+        setPrTokenCopied(true);
+        setTimeout(() => setPrTokenCopied(false), 2000);
+      })
+      .catch(console.error);
+  };
 
   // Save expected seconds when changed
   const handleExpectedSecondsChange = (seconds: number) => {
@@ -137,6 +173,7 @@ export function Settings({
   return (
     <Dialog>
       <DialogTrigger
+        aria-label="Open settings"
         className="p-2 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
         disabled={disabled}
       >
@@ -341,6 +378,49 @@ export function Settings({
                 {stockSymbolsSaved ? '✓ Saved' : 'Save'}
               </Button>
             </div>
+          </div>
+
+          {/* PR Publisher Token */}
+          <div className="space-y-2 border-t pt-4">
+            <label className="text-sm font-medium flex items-center gap-2">
+              <KeyRound className="h-4 w-4 text-muted-foreground" />
+              PR review publisher
+            </label>
+            <p className="text-xs text-muted-foreground">
+              Token the <code className="text-[11px]">publish-prs</code> CLI uses to push PRs needing review.
+              {prTokenConfigured ? ' A token is configured.' : ' No token yet.'}
+            </p>
+
+            {prToken ? (
+              <div className="space-y-1.5">
+                <div className="flex gap-2">
+                  <Input
+                    readOnly
+                    value={prToken}
+                    onFocus={(e) => e.target.select()}
+                    className="flex-1 font-mono text-xs"
+                  />
+                  <Button onClick={handleCopyToken} size="sm" variant="outline" className="gap-1.5 shrink-0">
+                    {prTokenCopied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+                    {prTokenCopied ? 'Copied' : 'Copy'}
+                  </Button>
+                </div>
+                <p className="text-xs text-amber-600 dark:text-amber-500">
+                  Shown once — copy it now. Set it as <code className="text-[11px]">STANDUP_INGEST_TOKEN</code> for the publisher.
+                </p>
+              </div>
+            ) : null}
+
+            <Button
+              onClick={handleResetToken}
+              size="sm"
+              variant="outline"
+              disabled={prTokenBusy}
+              className="gap-1.5"
+            >
+              <KeyRound className="h-4 w-4" />
+              {prTokenBusy ? 'Generating…' : prTokenConfigured ? 'Reset token' : 'Generate token'}
+            </Button>
           </div>
 
           {/* Data Management */}

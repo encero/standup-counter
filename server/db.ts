@@ -208,6 +208,30 @@ function runMigrations() {
     db.prepare("INSERT INTO _migrations (name) VALUES (?)").run('007_add_sprint_goal');
   }
 
+  // Migration 008: Add PR review queue (pushed in by the local publisher CLI)
+  if (!appliedMigrations.has('008_add_pr_status')) {
+    console.log('📦 Running migration 008: Adding PR review queue...');
+
+    // Per-team bearer token (stored as a SHA-256 hash, never plaintext) that the
+    // publisher CLI presents when pushing PR data. Generated via `npm run team pr-token`.
+    const columns = db.prepare("PRAGMA table_info(teams)").all() as { name: string }[];
+    if (!columns.some(c => c.name === 'pr_ingest_token_hash')) {
+      db.exec(`ALTER TABLE teams ADD COLUMN pr_ingest_token_hash TEXT`);
+    }
+
+    // Latest snapshot of PRs needing review, one row per team. payload is the
+    // JSON array of {author,title,repo,number}; updated_at is the bulk sync time.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS pr_status (
+        team_id    TEXT PRIMARY KEY,
+        payload    TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+    `);
+
+    db.prepare("INSERT INTO _migrations (name) VALUES (?)").run('008_add_pr_status');
+  }
+
   console.log('✅ Database migrations complete');
 }
 

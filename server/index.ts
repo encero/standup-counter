@@ -6,6 +6,7 @@ import { createServer } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { parse as parseUrl } from 'url';
 import { networkInterfaces } from 'os';
+import { createHash, timingSafeEqual, randomBytes } from 'crypto';
 import db from './db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -665,10 +666,13 @@ teamRouter.get('/trends/members', (req, res) => {
 // Team settings endpoints
 teamRouter.get('/settings', (req, res) => {
   const { teamId } = req.params;
-  const team = db.prepare('SELECT stock_symbols, expected_seconds FROM teams WHERE id = ?').get(teamId) as { stock_symbols: string; expected_seconds: number } | undefined;
+  const team = db.prepare('SELECT stock_symbols, expected_seconds, pr_ingest_token_hash FROM teams WHERE id = ?').get(teamId) as { stock_symbols: string; expected_seconds: number; pr_ingest_token_hash: string | null } | undefined;
   res.json({
     stockSymbols: team?.stock_symbols || '',
     expectedSeconds: team?.expected_seconds ?? 90,
+    // Whether a publisher ingest token exists (the token itself is never returned —
+    // only its hash is stored; the raw value is shown once at generation time).
+    prTokenConfigured: Boolean(team?.pr_ingest_token_hash),
   });
 });
 
@@ -721,6 +725,99 @@ teamRouter.put('/sprint', (req, res) => {
   // Push the new state to every connected client so banners/dialogs update live.
   broadcastToTeam(teamId, { type: 'sprint', sprint: status });
   res.json(status);
+});
+
+// --- PR review queue --------------------------------------------------------
+// PRs needing review are PUSHED in by a local publisher CLI (see
+// scripts/publish-prs.ts) that runs where the private repo is reachable. The
+// app server never talks to GitHub. Auth is a per-team bearer token; we store
+// only its SHA-256 hash and compare in constant time.
+
+interface PrInfo {
+  author: string;
+  title: string;
+  repo: string;   // "owner/name"
+  number: number;
+}
+
+const MAX_PRS = 200;
+
+function hashToken(token: string): string {
+  return createHash('sha256').update(token).digest('hex');
+}
+
+// Constant-time compare of two hex-encoded SHA-256 hashes.
+function tokensMatch(presented: string, expectedHashHex: string): boolean {
+  const a = Buffer.from(hashToken(presented), 'hex');
+  const b = Buffer.from(expectedHashHex, 'hex');
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function getPrStatus(teamId: string): { prs: PrInfo[]; syncedAt: number | null } {
+  const row = db.prepare('SELECT payload, updated_at FROM pr_status WHERE team_id = ?')
+    .get(teamId) as { payload: string; updated_at: number } | undefined;
+  if (!row) return { prs: [], syncedAt: null };
+  try {
+    return { prs: JSON.parse(row.payload) as PrInfo[], syncedAt: row.updated_at };
+  } catch {
+    return { prs: [], syncedAt: null };
+  }
+}
+
+// Rotate (or first-time generate) the team's ingest token. Returns the raw
+// token ONCE — only its hash is stored, so it can't be retrieved later.
+teamRouter.post('/pr-status/token', (req, res) => {
+  const { teamId } = req.params;
+  const token = randomBytes(24).toString('hex');
+  db.prepare('UPDATE teams SET pr_ingest_token_hash = ? WHERE id = ?').run(hashToken(token), teamId);
+  res.json({ token });
+});
+
+// Read the latest snapshot (initial load; live updates arrive via WS 'pr_status').
+teamRouter.get('/pr-status', (req, res) => {
+  res.json(getPrStatus(req.params.teamId));
+});
+
+// Ingest a fresh snapshot from the publisher CLI. Bearer-token authed.
+teamRouter.post('/pr-status', (req, res) => {
+  const { teamId } = req.params;
+  const row = db.prepare('SELECT pr_ingest_token_hash FROM teams WHERE id = ?')
+    .get(teamId) as { pr_ingest_token_hash: string | null } | undefined;
+  const expected = row?.pr_ingest_token_hash;
+
+  if (!expected) {
+    res.status(403).json({ error: 'No ingest token configured. Run: npm run team pr-token ' + teamId });
+    return;
+  }
+
+  const auth = req.header('authorization') || '';
+  const presented = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  if (!presented || !tokensMatch(presented, expected)) {
+    res.status(401).json({ error: 'Invalid ingest token' });
+    return;
+  }
+
+  // Normalize + bound the payload — the publisher already filtered, but never
+  // trust the wire. Keep only the four minimal fields.
+  const rawPrs = Array.isArray(req.body?.prs) ? req.body.prs : [];
+  const prs: PrInfo[] = rawPrs
+    .slice(0, MAX_PRS)
+    .map((p: Partial<PrInfo>): PrInfo => ({
+      author: String(p?.author ?? '').slice(0, 100),
+      title: String(p?.title ?? '').slice(0, 300),
+      repo: String(p?.repo ?? '').slice(0, 140),
+      number: Number(p?.number) || 0,
+    }))
+    .filter((p: PrInfo) => p.repo && p.number > 0);
+
+  const updatedAt = Date.now();
+  db.prepare('INSERT OR REPLACE INTO pr_status (team_id, payload, updated_at) VALUES (?, ?, ?)')
+    .run(teamId, JSON.stringify(prs), updatedAt);
+
+  // Push to every connected client so panels update live (mirrors 'sprint').
+  broadcastToTeam(teamId, { type: 'pr_status', prs, syncedAt: updatedAt });
+
+  res.json({ ok: true, count: prs.length, syncedAt: updatedAt });
 });
 
 // Stock quotes endpoint - with 30-day history for charts

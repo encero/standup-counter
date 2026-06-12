@@ -12,6 +12,7 @@ import { Settings } from '@/components/Settings';
 import { StandupSummary } from '@/components/StandupSummary';
 import { SyncNotesPanel, SyncNotesDialog } from '@/components/SyncNotes';
 import { SprintGoalBanner, SprintGoalDialog } from '@/components/SprintGoal';
+import { PrReviewQueue } from '@/components/PrReviewQueue';
 import type { SyncNote } from '@/types/standup';
 import { cn } from '@/lib/utils';
 
@@ -22,7 +23,7 @@ export function StandupTimer() {
     teamId, teamMembers, sessions, currentSpeaker, currentStandupId, status, elapsedTime, interruptions,
     endedStandupId, syncNotes, endedStandupNotes, connectionStatus, startTimer, pauseTimer, resumeTimer,
     stopTimer, addMember, removeMember, addSyncNote, removeSyncNote, clearSessions, clearEndedStandupId,
-    sprintStatus, updateSprint, markGoalDone, formatTime,
+    sprintStatus, updateSprint, markGoalDone, formatTime, prs, prsSyncedAt,
   } = useStandup();
 
   // Disconnected/reconnecting are surfaced immediately; a transient 'connecting'
@@ -314,6 +315,9 @@ export function StandupTimer() {
             />
           </CardContent>
         </Card>
+
+        {/* PR review queue - open PRs by the team awaiting human review */}
+        <PrReviewQueue prs={prs} syncedAt={prsSyncedAt} />
 
         {/* Sync / Parking Lot - quick notes to revisit after standup */}
         <SyncNotesPanel

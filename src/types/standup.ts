@@ -24,6 +24,15 @@ export interface SyncNote {
   createdAt: number;
 }
 
+// A PR needing review, pushed in by the publisher CLI. Minimal by design —
+// the clickable link is built client-side from repo + number.
+export interface PrInfo {
+  author: string;
+  title: string;
+  repo: string;   // "owner/name"
+  number: number;
+}
+
 export interface StandupState {
   teamMembers: TeamMember[];
   currentSpeaker: TeamMember | null;

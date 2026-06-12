@@ -40,6 +40,20 @@ function configureSprintInDb(
   db.close();
 }
 
+// Helper to seed the PR review queue directly in the database. The pr_status
+// table is created by migration 008 when the test server boots, so it exists by
+// the time these UI tests run. An empty array seeds a "nothing to review"
+// snapshot; not calling this at all leaves the never-synced state.
+function seedPrStatusInDb(
+  teamId: string,
+  prs: Array<{ author: string; title: string; repo: string; number: number }>
+): void {
+  const db = new Database(TEST_DB_PATH);
+  db.prepare('INSERT OR REPLACE INTO pr_status (team_id, payload, updated_at) VALUES (?, ?, ?)')
+    .run(teamId, JSON.stringify(prs), Date.now());
+  db.close();
+}
+
 // Helper to create standup data for trends testing
 function createStandupData(teamId: string) {
   const db = new Database(TEST_DB_PATH);
@@ -685,5 +699,71 @@ test.describe('Sprint Goal', () => {
     // No goal check — straight to the sync review.
     await expect(page.getByText('Time to sync')).toBeVisible({ timeout: 5000 });
     await expect(page.getByText('Sprint goal check')).toHaveCount(0);
+  });
+});
+
+test.describe('PR Review Queue (UI)', () => {
+  test('panel is hidden until something has been synced', async ({ page }) => {
+    const teamId = createTeamInDb('No PRs Team', ['Alice']);
+    await page.goto(`/${teamId}`);
+
+    // Wait for the page to settle (team members render), then assert the panel
+    // is absent because nothing has ever been published for this team.
+    await expect(page.getByRole('button', { name: /Alice/ })).toBeVisible({ timeout: 10000 });
+    await expect(page.getByText('Needs review')).toHaveCount(0);
+  });
+
+  test('shows synced PRs with author and a link to the PR', async ({ page }) => {
+    const teamId = createTeamInDb('Review Team', ['Alice']);
+    seedPrStatusInDb(teamId, [
+      { author: 'arunesh', title: 'Fix retry backoff', repo: 'acme/web', number: 482 },
+      { author: 'meredith', title: 'Add health checks', repo: 'acme/api', number: 17 },
+    ]);
+    await page.goto(`/${teamId}`);
+
+    await expect(page.getByText('Needs review')).toBeVisible({ timeout: 10000 });
+    // Count badge reflects the two PRs.
+    await expect(page.getByText('(2)')).toBeVisible();
+
+    // Titles and authors render.
+    await expect(page.getByText('Fix retry backoff')).toBeVisible();
+    await expect(page.getByText('arunesh')).toBeVisible();
+
+    // Each row links to the built PR URL (repo + number).
+    const link = page.getByRole('link', { name: /Fix retry backoff/ });
+    await expect(link).toHaveAttribute('href', 'https://github.com/acme/web/pull/482');
+  });
+
+  test('shows an empty state when a sync reports no PRs to review', async ({ page }) => {
+    const teamId = createTeamInDb('Empty Queue Team', ['Alice']);
+    seedPrStatusInDb(teamId, []);
+    await page.goto(`/${teamId}`);
+
+    await expect(page.getByText('Needs review')).toBeVisible({ timeout: 10000 });
+    await expect(page.getByText(/Nothing waiting for review/)).toBeVisible();
+  });
+});
+
+test.describe('PR Publisher Token (Settings UI)', () => {
+  test('generating a token reveals it once and flips the button to Reset', async ({ page }) => {
+    const teamId = createTeamInDb('Token Team', ['Alice']);
+    await page.goto(`/${teamId}`);
+
+    await page.getByRole('button', { name: 'Open settings' }).click();
+
+    // Section is present and reports no token yet.
+    await expect(page.getByText('PR review publisher')).toBeVisible({ timeout: 10000 });
+    const generate = page.getByRole('button', { name: 'Generate token' });
+    await expect(generate).toBeVisible();
+
+    await generate.click();
+
+    // The freshly minted token is shown once, with the copy guidance.
+    await expect(page.getByText('Shown once', { exact: false })).toBeVisible({ timeout: 5000 });
+    const tokenInput = page.locator('input[readonly]');
+    await expect(tokenInput).toHaveValue(/^[0-9a-f]{48}$/);
+
+    // Now that a token exists, the action becomes a rotate.
+    await expect(page.getByRole('button', { name: 'Reset token' })).toBeVisible();
   });
 });

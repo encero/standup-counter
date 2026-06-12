@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ConnectionManager, type ConnectionStatus } from '@/lib/ConnectionManager';
-import type { TeamMember, SpeakerSession, SyncNote, TimerStatus, SprintStatus } from '@/types/standup';
+import type { TeamMember, SpeakerSession, SyncNote, TimerStatus, SprintStatus, PrInfo } from '@/types/standup';
 
 export type { ConnectionStatus };
 
@@ -44,6 +44,8 @@ export function useStandupTimer(teamId: string) {
   const [endedStandupNotes, setEndedStandupNotes] = useState<SyncNote[]>([]);
   const [connectionStatus, setConnectionStatus] = useState<ConnectionStatus>('connecting');
   const [sprintStatus, setSprintStatus] = useState<SprintStatus | null>(null);
+  const [prs, setPrs] = useState<PrInfo[]>([]);
+  const [prsSyncedAt, setPrsSyncedAt] = useState<number | null>(null);
 
   // Sprint goal status is DB-backed (not part of the in-memory timer state), so
   // fetch a snapshot on load; live edits arrive via the 'sprint' WS broadcast.
@@ -52,6 +54,15 @@ export function useStandupTimer(teamId: string) {
     ConnectionManager.get<SprintStatus>(`${API_URL}/sprint`)
       .then(setSprintStatus)
       .catch(err => console.error('Failed to load sprint status:', err));
+  }, [teamId, API_URL]);
+
+  // PR review queue is DB-backed (pushed in by the publisher CLI). Fetch a
+  // snapshot on load; live updates arrive via the 'pr_status' WS broadcast.
+  useEffect(() => {
+    if (!teamId) return;
+    ConnectionManager.get<{ prs: PrInfo[]; syncedAt: number | null }>(`${API_URL}/pr-status`)
+      .then(({ prs, syncedAt }) => { setPrs(prs); setPrsSyncedAt(syncedAt); })
+      .catch(err => console.error('Failed to load PR status:', err));
   }, [teamId, API_URL]);
 
   const startTimeRef = useRef<number | null>(null);
@@ -186,6 +197,10 @@ export function useStandupTimer(teamId: string) {
       } else if (msg.type === 'sprint') {
         // Sprint goal config/done changed (possibly from another client)
         setSprintStatus(msg.sprint as SprintStatus);
+      } else if (msg.type === 'pr_status') {
+        // Publisher CLI pushed a fresh PR review queue
+        setPrs((msg.prs as PrInfo[]) ?? []);
+        setPrsSyncedAt(msg.syncedAt as number | null);
       }
     });
 
@@ -326,6 +341,8 @@ export function useStandupTimer(teamId: string) {
     isLoading,
     connectionStatus,
     sprintStatus,
+    prs,
+    prsSyncedAt,
     updateSprint,
     markGoalDone,
     startTimer,

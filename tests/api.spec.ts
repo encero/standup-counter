@@ -387,6 +387,119 @@ test.describe('Sprint Goal API', () => {
   });
 });
 
+test.describe('PR Status API', () => {
+  // Authed POST to the ingest endpoint (the shared `api` helper can't set headers).
+  async function ingest(teamId: string, token: string | null, body: object) {
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+    const response = await fetch(`${BASE_URL}/api/${teamId}/pr-status`, {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(body),
+    });
+    return { status: response.status, data: await response.json().catch(() => null) };
+  }
+
+  async function mintToken(teamId: string): Promise<string> {
+    const { data } = await api('POST', `/api/${teamId}/pr-status/token`);
+    return data.token as string;
+  }
+
+  test('GET returns empty queue before anything is published', async () => {
+    const teamId = createTeamInDb('PR Team');
+    const { status, data } = await api('GET', `/api/${teamId}/pr-status`);
+
+    expect(status).toBe(200);
+    expect(data.prs).toEqual([]);
+    expect(data.syncedAt).toBeNull();
+  });
+
+  test('settings reports prTokenConfigured false until a token is generated', async () => {
+    const teamId = createTeamInDb('PR Team');
+
+    const before = await api('GET', `/api/${teamId}/settings`);
+    expect(before.data.prTokenConfigured).toBe(false);
+
+    await mintToken(teamId);
+
+    const after = await api('GET', `/api/${teamId}/settings`);
+    expect(after.data.prTokenConfigured).toBe(true);
+  });
+
+  test('token generation returns a raw token but the GET never exposes it', async () => {
+    const teamId = createTeamInDb('PR Team');
+    const token = await mintToken(teamId);
+
+    expect(token).toMatch(/^[0-9a-f]{48}$/);
+
+    // The token must not leak through settings or the queue read.
+    const settings = await api('GET', `/api/${teamId}/settings`);
+    expect(JSON.stringify(settings.data)).not.toContain(token);
+  });
+
+  test('ingest is rejected before a token exists (403)', async () => {
+    const teamId = createTeamInDb('PR Team');
+    const { status } = await ingest(teamId, 'anything', { prs: [] });
+    expect(status).toBe(403);
+  });
+
+  test('ingest with a valid token stores the queue and stamps syncedAt', async () => {
+    const teamId = createTeamInDb('PR Team');
+    const token = await mintToken(teamId);
+
+    const before = Date.now();
+    const post = await ingest(teamId, token, {
+      prs: [
+        { author: 'alice', title: 'Fix retry backoff', repo: 'acme/web', number: 482 },
+        { author: 'bob', title: 'Add metrics', repo: 'acme/web', number: 501 },
+      ],
+    });
+    expect(post.status).toBe(200);
+    expect(post.data.count).toBe(2);
+
+    const { data } = await api('GET', `/api/${teamId}/pr-status`);
+    expect(data.prs).toHaveLength(2);
+    expect(data.prs[0]).toEqual({ author: 'alice', title: 'Fix retry backoff', repo: 'acme/web', number: 482 });
+    expect(data.syncedAt).toBeGreaterThanOrEqual(before);
+  });
+
+  test('ingest with a wrong token is rejected (401)', async () => {
+    const teamId = createTeamInDb('PR Team');
+    await mintToken(teamId);
+
+    const { status } = await ingest(teamId, 'deadbeef'.repeat(6), { prs: [] });
+    expect(status).toBe(401);
+  });
+
+  test('rotating the token invalidates the previous one', async () => {
+    const teamId = createTeamInDb('PR Team');
+    const first = await mintToken(teamId);
+    const second = await mintToken(teamId);
+    expect(second).not.toBe(first);
+
+    expect((await ingest(teamId, first, { prs: [] })).status).toBe(401);
+    expect((await ingest(teamId, second, { prs: [] })).status).toBe(200);
+  });
+
+  test('ingest strips extra fields and drops malformed entries', async () => {
+    const teamId = createTeamInDb('PR Team');
+    const token = await mintToken(teamId);
+
+    await ingest(teamId, token, {
+      prs: [
+        { author: 'alice', title: 'Good', repo: 'acme/web', number: 1, reviewDecision: 'REVIEW_REQUIRED', secret: 'x' },
+        { author: 'bob', title: 'No repo', number: 2 },   // dropped: missing repo
+        { author: 'carol', title: 'No number', repo: 'acme/web' }, // dropped: missing number
+      ],
+    });
+
+    const { data } = await api('GET', `/api/${teamId}/pr-status`);
+    expect(data.prs).toHaveLength(1);
+    expect(data.prs[0]).toEqual({ author: 'alice', title: 'Good', repo: 'acme/web', number: 1 });
+    expect(Object.keys(data.prs[0]).sort()).toEqual(['author', 'number', 'repo', 'title']);
+  });
+});
+
 test.describe('Trends API', () => {
   // Helper to create standup data
   async function createStandupData(teamId: string) {

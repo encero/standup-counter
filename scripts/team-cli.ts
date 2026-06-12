@@ -12,6 +12,7 @@
 import Database from 'better-sqlite3';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { randomBytes, createHash } from 'crypto';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const dbPath = process.env.DB_PATH || path.join(__dirname, '..', 'standup.db');
@@ -154,6 +155,31 @@ function migrateOrphanedData(teamId: string) {
   console.log(`\n✅ Migration complete!\n`);
 }
 
+function generatePrToken(teamId: string) {
+  const team = db.prepare('SELECT name FROM teams WHERE id = ?').get(teamId) as { name: string } | undefined;
+  if (!team) {
+    console.error(`\n❌ Team not found: ${teamId}\n`);
+    process.exit(1);
+  }
+
+  // The column normally arrives via server migration 008; add it defensively in
+  // case the CLI runs against a DB the server hasn't opened yet.
+  const cols = db.prepare("PRAGMA table_info(teams)").all() as { name: string }[];
+  if (!cols.some(c => c.name === 'pr_ingest_token_hash')) {
+    db.exec('ALTER TABLE teams ADD COLUMN pr_ingest_token_hash TEXT');
+  }
+
+  const token = randomBytes(24).toString('hex');
+  const hash = createHash('sha256').update(token).digest('hex');
+  db.prepare('UPDATE teams SET pr_ingest_token_hash = ? WHERE id = ?').run(hash, teamId);
+
+  console.log(`\n✅ Ingest token generated for "${team.name}" (any previous token is now revoked)\n`);
+  console.log(`   ${token}\n`);
+  console.log(`⚠️  Shown once — only its hash is stored. Use it with the publisher:`);
+  console.log(`   STANDUP_INGEST_TOKEN=${token} \\`);
+  console.log(`     npm run publish-prs -- --repo owner/name --team ${teamId} --app http://localhost:3001 --authors alice,bob\n`);
+}
+
 // Command router
 switch (command) {
   case 'create': {
@@ -205,6 +231,15 @@ switch (command) {
     migrateOrphanedData(migrateTeamId);
     break;
   }
+  case 'pr-token': {
+    const tokenTeamId = process.argv[3];
+    if (!tokenTeamId) {
+      console.error('Usage: team pr-token <team_id>');
+      process.exit(1);
+    }
+    generatePrToken(tokenTeamId);
+    break;
+  }
   default:
     console.log(`
 Team Management CLI
@@ -216,6 +251,7 @@ Commands:
   add-member <team_id> <name>  Add a member to a team
   info <team_id>               Show team details
   migrate <team_id>            Migrate orphaned data to a team
+  pr-token <team_id>           Generate/rotate the PR publisher ingest token
 
 Examples:
   npm run team create "Engineering"
