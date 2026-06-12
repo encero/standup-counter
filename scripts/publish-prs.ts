@@ -31,7 +31,7 @@ interface Args {
   repo: string;
   team: string;
   app: string;
-  authors: Set<string>;
+  authors: string[];
   token: string;
   watch: boolean;
   interval: number; // seconds
@@ -78,9 +78,9 @@ function parseArgs(argv: string[]): Args {
     process.exit(1);
   }
 
-  const authors = new Set(
-    authorsRaw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-  );
+  // Preserve original case (GitHub logins are passed verbatim to `gh --author`)
+  // and de-dupe.
+  const authors = [...new Set(authorsRaw.split(',').map(s => s.trim()).filter(Boolean))];
 
   return {
     repo: repo!,
@@ -94,30 +94,45 @@ function parseArgs(argv: string[]): Args {
   };
 }
 
-async function fetchPrs(repo: string): Promise<GhPr[]> {
+// Fetch one author's open PRs. We query PER AUTHOR with gh's server-side
+// `--author` filter rather than listing all open PRs and filtering locally:
+// busy monorepos can have 1000+ open PRs (gh's hard cap), so a global
+// `--limit` silently drops older PRs — including ones that need review. Each
+// person has only a handful of open PRs, so per-author queries never paginate.
+async function fetchPrsForAuthor(repo: string, author: string): Promise<GhPr[]> {
   try {
     const { stdout } = await execFileAsync('gh', [
       'pr', 'list',
       '--repo', repo,
       '--state', 'open',
+      '--author', author,
       '--limit', '200',
       '--json', 'number,title,author,reviewDecision,isDraft',
     ], { maxBuffer: 10 * 1024 * 1024 });
     return JSON.parse(stdout) as GhPr[];
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`\n❌ Failed to fetch PRs via gh for ${repo}.`);
+    console.error(`\n❌ Failed to fetch PRs via gh for ${repo} (author ${author}).`);
     console.error(`   Make sure gh is installed and authed (gh auth status). Details:\n   ${msg}\n`);
     throw err;
   }
 }
 
-// Keep PRs that need human review, by an allowlisted author, excluding drafts.
-function selectNeedsReview(prs: GhPr[], repo: string, authors: Set<string>): PrInfo[] {
+// Fetch every allowlisted author's open PRs (in parallel) and de-dupe by number.
+async function fetchPrs(repo: string, authors: string[]): Promise<GhPr[]> {
+  const perAuthor = await Promise.all(authors.map(a => fetchPrsForAuthor(repo, a)));
+  const byNumber = new Map<number, GhPr>();
+  for (const pr of perAuthor.flat()) byNumber.set(pr.number, pr);
+  return [...byNumber.values()];
+}
+
+// Keep PRs that need human review, excluding drafts. (Author filtering already
+// happened server-side via `gh --author`.)
+function selectNeedsReview(prs: GhPr[], repo: string): PrInfo[] {
   return prs
     .filter(pr => !pr.isDraft)
     .filter(pr => pr.reviewDecision !== 'APPROVED')
-    .filter(pr => pr.author && authors.has(pr.author.login.toLowerCase()))
+    .filter(pr => pr.author)
     .map(pr => ({ author: pr.author!.login, title: pr.title, repo, number: pr.number }));
 }
 
@@ -138,11 +153,11 @@ async function publish(args: Args, prs: PrInfo[]): Promise<void> {
 }
 
 async function runOnce(args: Args): Promise<void> {
-  const all = await fetchPrs(args.repo);
-  const needsReview = selectNeedsReview(all, args.repo, args.authors);
+  const all = await fetchPrs(args.repo, args.authors);
+  const needsReview = selectNeedsReview(all, args.repo);
 
   const ts = new Date().toLocaleTimeString();
-  console.log(`[${ts}] ${args.repo}: ${all.length} open → ${needsReview.length} need review (by ${args.authors.size} allowlisted author(s))`);
+  console.log(`[${ts}] ${args.repo}: ${all.length} open by ${args.authors.length} author(s) → ${needsReview.length} need review`);
   for (const pr of needsReview) {
     console.log(`   #${pr.number}  ${pr.author.padEnd(16)} ${pr.title}`);
   }
