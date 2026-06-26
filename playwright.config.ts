@@ -13,7 +13,7 @@ export default defineConfig({
   globalTeardown: './tests/global-teardown.ts',
 
   use: {
-    baseURL: 'http://localhost:3001',
+    baseURL: `http://localhost:${process.env.TEST_PORT || 3100}`,
     trace: 'on-first-retry',
     screenshot: 'only-on-failure',
   },

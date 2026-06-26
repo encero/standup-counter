@@ -12,7 +12,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Test database path
 export const TEST_DB_PATH = path.join(__dirname, '..', 'test-standup.db');
-export const BASE_URL = 'http://localhost:3001';
+// Tests run on their own port (default 3100, override with TEST_PORT) so the
+// suite never collides with a dev server on the app's usual 3001.
+export const TEST_PORT = Number(process.env.TEST_PORT) || 3100;
+export const BASE_URL = `http://localhost:${TEST_PORT}`;
+export const WS_BASE = `ws://localhost:${TEST_PORT}`;
 
 let serverProcess: ChildProcess | null = null;
 
@@ -184,7 +188,7 @@ export async function startServer(): Promise<void> {
       env: {
         ...process.env,
         DB_PATH: TEST_DB_PATH,
-        PORT: '3001',
+        PORT: String(TEST_PORT),
         NODE_ENV: 'production', // Use production mode to serve static files
       },
       stdio: ['ignore', 'pipe', 'pipe'],

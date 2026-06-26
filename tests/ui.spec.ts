@@ -592,18 +592,18 @@ test.describe('Sprint Goal', () => {
 
   test('calm banner shows the goal early in the sprint', async ({ page }) => {
     const teamId = createTeamInDb('Calm Sprint Team', ['Alice']);
-    // Day 0 of a 14-day sprint => 14 days left, well above the notice threshold (7).
+    // Day 0 of a 14-day sprint => 13 days left after today, well above the notice threshold (7).
     configureSprintInDb(teamId, { goal: 'Ship checkout v2', startDaysAgo: 0, lengthDays: 14 });
     await page.goto(`/${teamId}`);
 
     await expect(page.getByText('Sprint goal in progress')).toBeVisible({ timeout: 10000 });
     await expect(page.getByText('Ship checkout v2')).toBeVisible();
-    await expect(page.getByText('14 days left')).toBeVisible();
+    await expect(page.getByText('13 days left')).toBeVisible();
   });
 
   test('banner escalates to an aggressive critical alert on the last day', async ({ page }) => {
     const teamId = createTeamInDb('Critical Sprint Team', ['Alice']);
-    // Day 13 of a 14-day sprint => 1 day left => critical (<= threshold 1).
+    // Day 13 of a 14-day sprint => the final day => 0 days left => critical (<= threshold 1).
     configureSprintInDb(teamId, { goal: 'Cut the release', startDaysAgo: 13, lengthDays: 14 });
     await page.goto(`/${teamId}`);
 
@@ -611,7 +611,7 @@ test.describe('Sprint Goal', () => {
     await expect(alert).toBeVisible({ timeout: 10000 });
     await expect(alert).toContainText('the goal is STILL not done');
     await expect(alert).toContainText('Cut the release');
-    await expect(page.getByText('Last day')).toBeVisible();
+    await expect(page.getByText('0 days left')).toBeVisible();
     // The critical level applies the angry shake animation.
     await expect(alert).toHaveClass(/animate-angry-shake/);
   });

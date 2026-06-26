@@ -172,6 +172,11 @@ wss.on('connection', (ws, req) => {
           timerState.totalPaused = 0;
           timerState.pauseStart = null;
           broadcastToTeam(teamId, { type: 'state', ...timerState });
+          // Push fresh sprint status too: a long-lived client (wall display,
+          // sidebar) may have been open across a sprint boundary, and we can't
+          // rely on anyone reloading at midnight. Recomputing on standup start
+          // rolls the banner over to the current window for everyone.
+          broadcastToTeam(teamId, { type: 'sprint', sprint: computeSprintStatus(teamId) });
           break;
 
         case 'pause':
@@ -325,7 +330,7 @@ interface SprintStatus {
   sprintStart: number;      // ms — start of the CURRENT sprint window
   sprintEnd: number;        // ms — end of the current window (exclusive)
   elapsedFraction: number;  // 0..1 progress through the current window
-  daysRemaining: number;    // whole calendar days left in the window
+  daysRemaining: number;    // whole calendar days left AFTER today (0 on the final day)
   done: boolean;            // goal marked done within the current window
   thresholds: SprintThresholds; // days-remaining cutoffs for each urgency level
 }
@@ -393,7 +398,10 @@ function computeSprintStatus(teamId: string): SprintStatus {
   const sprintStart = anchorMs + index * lenMs;
   const sprintEnd = sprintStart + lenMs;
   const elapsedFraction = Math.min(1, Math.max(0, (now - sprintStart) / lenMs));
-  const daysRemaining = Math.max(0, Math.ceil((sprintEnd - now) / DAY_MS));
+  // Count whole days left AFTER today: floor, not ceil, so today's partially
+  // elapsed day is not counted as remaining. A 14-day sprint that starts Tuesday
+  // ends the second Monday, and that Monday reads 0 days left.
+  const daysRemaining = Math.max(0, Math.floor((sprintEnd - now) / DAY_MS));
   const done = doneAt != null && doneAt >= sprintStart && doneAt < sprintEnd;
 
   return {

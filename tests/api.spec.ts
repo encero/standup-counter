@@ -3,7 +3,7 @@
  * Tests the HTTP API endpoints for teams, members, sessions, and trends
  */
 import { test, expect } from '@playwright/test';
-import { BASE_URL, generateTeamId, TEST_DB_PATH } from './test-helpers';
+import { BASE_URL, TEST_PORT, generateTeamId, TEST_DB_PATH } from './test-helpers';
 import Database from 'better-sqlite3';
 
 // Helper to make API requests
@@ -48,7 +48,7 @@ test.describe('Server Info API', () => {
     expect(data).toHaveProperty('port');
     expect(data).toHaveProperty('localUrl');
     expect(data).toHaveProperty('networkUrls');
-    expect(data.port).toBe(3001);
+    expect(data.port).toBe(TEST_PORT);
   });
 });
 
@@ -357,7 +357,7 @@ test.describe('Sprint Goal API', () => {
     expect(data.configured).toBe(true);
     expect(data.hasGoal).toBe(true);
     expect(data.goal).toBe('Ship checkout v2');
-    expect(data.daysRemaining).toBe(9); // 14 - 5
+    expect(data.daysRemaining).toBe(8); // 14 - 5, minus today (days left are counted after today)
     expect(data.elapsedFraction).toBeGreaterThan(0.3);
     expect(data.elapsedFraction).toBeLessThan(0.5);
     expect(data.thresholds).toEqual({ notice: 5, warning: 3, critical: 1 });

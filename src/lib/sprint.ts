@@ -41,8 +41,9 @@ export function sprintLevel(status: SprintStatus): SprintLevel {
 }
 
 function daysLabel(daysRemaining: number): string {
-  if (daysRemaining <= 0) return 'Sprint over';
-  if (daysRemaining === 1) return 'Last day';
+  // daysRemaining is days left AFTER today, so 0 means today is the final day.
+  if (daysRemaining <= 0) return '0 days left';
+  if (daysRemaining === 1) return '1 day left';
   return `${daysRemaining} days left`;
 }
 
@@ -142,7 +143,7 @@ export function getSprintUrgency(status: SprintStatus): SprintUrgency {
       subline = goal;
       break;
     case 'critical':
-      headline = status.daysRemaining <= 1
+      headline = status.daysRemaining <= 0
         ? 'LAST CHANCE — the goal is STILL not done!'
         : "Time's almost up and the goal is NOT done!";
       subline = goal;

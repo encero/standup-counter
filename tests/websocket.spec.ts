@@ -4,10 +4,8 @@
  */
 import { test, expect } from '@playwright/test';
 import { WebSocket, type RawData } from 'ws';
-import { generateTeamId, TEST_DB_PATH } from './test-helpers';
+import { WS_BASE, generateTeamId, TEST_DB_PATH } from './test-helpers';
 import Database from 'better-sqlite3';
-
-const WS_BASE = 'ws://localhost:3001';
 
 // Parsed WebSocket message; concrete fields are read ad hoc in assertions.
 type WsMessage = { type: string; [key: string]: unknown };
@@ -455,5 +453,54 @@ test.describe('Team Isolation', () => {
 
     wsTeam1.close();
     wsTeam2.close();
+  });
+});
+
+test.describe('Sprint Rollover on Standup Start', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+
+  // A YYYY-MM-DD date n days before today (local midnight), matching how the
+  // server anchors sprint windows.
+  function daysAgoISO(n: number): string {
+    const d = new Date();
+    d.setHours(0, 0, 0, 0);
+    d.setDate(d.getDate() - n);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  // The behavior we're locking: a long-lived client (wall display / sidebar)
+  // can sit open across a sprint boundary with no one reloading at midnight.
+  // Starting a standup must push fresh sprint status so its banner rolls over.
+  test('start pushes current-window sprint status to connected clients', async () => {
+    const teamId = createTeamInDb('Rollover Team', ['Alice']);
+
+    // 14-day cadence anchored 20 days ago => "now" sits in the SECOND window
+    // [day-6, day+8). The goal was marked done 15 days ago, inside the FIRST
+    // window, so it must NOT count as done for the current one.
+    const db = new Database(TEST_DB_PATH);
+    db.prepare(
+      'UPDATE teams SET sprint_goal = ?, sprint_start = ?, sprint_length_days = 14, sprint_goal_done_at = ? WHERE id = ?'
+    ).run('Carryover goal', daysAgoISO(20), Date.now() - 15 * DAY, teamId);
+    db.close();
+
+    const { ws } = await connectWebSocket(teamId);
+
+    // Starting a standup should trigger a 'sprint' broadcast alongside 'state'.
+    const sprintPromise = waitForMessage(ws, 'sprint');
+    ws.send(JSON.stringify({ type: 'start', speaker: { id: crypto.randomUUID(), name: 'Alice' } }));
+    const sprint = (await sprintPromise).sprint as {
+      configured: boolean; hasGoal: boolean; done: boolean; daysRemaining: number;
+    };
+
+    expect(sprint.configured).toBe(true);
+    expect(sprint.hasGoal).toBe(true);
+    // Rolled into the current window: the prior window's done flag is cleared...
+    expect(sprint.done).toBe(false);
+    // ...and days-remaining reflects the current window, not the expired one
+    // (which would have read 0).
+    expect(sprint.daysRemaining).toBeGreaterThan(0);
+    expect(sprint.daysRemaining).toBeLessThanOrEqual(14);
+
+    ws.close();
   });
 });
