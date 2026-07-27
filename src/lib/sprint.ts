@@ -1,22 +1,25 @@
-import { Target, CheckCircle2, AlertTriangle, Skull, type LucideIcon } from 'lucide-react';
-import type { SprintStatus } from '@/types/standup';
+import { Target, CheckCircle2, AlertTriangle, Skull, Plus, type LucideIcon } from 'lucide-react';
+import type { SprintStatus, SprintLevel } from '@/types/standup';
 
 /**
- * Presentation layer for sprint-goal urgency. The server hands us the facts
- * (elapsed fraction, days left, configurable thresholds, done flag); here we map
- * them to an escalating "angrier the closer to the deadline" visual treatment
- * that is shared by the main-page banner and the end-of-standup dialog.
+ * Presentation layer for sprint-goal urgency. The server fully derives the facts
+ * — the urgency `level`, days left, the window's end date, done flag — and here we
+ * map that level to an escalating "angrier the closer to the deadline" visual
+ * treatment shared by the main-page banner and the end-of-standup dialog. No date
+ * math or threshold logic lives on the client.
  */
 
-export type SprintLevel = 'idle' | 'done' | 'calm' | 'notice' | 'warning' | 'critical';
+export type { SprintLevel };
 
 export interface SprintUrgency {
   level: SprintLevel;
-  show: boolean; // whether the banner/dialog should render at all
+  show: boolean;      // whether the banner/dialog should render at all
+  isEmpty: boolean;   // configured but no goal yet — render the "set a goal" prompt
   icon: LucideIcon;
   headline: string;
   subline: string;
-  daysLabel: string;
+  daysLabel: string;  // e.g. "Last day", "4 days left"
+  metaLabel: string;  // e.g. "Day 6 of 10 · ends Fri Jul 25"
   // tailwind class bundles, keyed off the level
   banner: string;
   iconWrap: string;
@@ -28,23 +31,18 @@ export interface SprintUrgency {
   confirmBtn: string;
 }
 
-export function sprintLevel(status: SprintStatus): SprintLevel {
-  if (!status.configured || !status.hasGoal) return 'idle';
-  if (status.done) return 'done';
-  // Thresholds are days-remaining cutoffs: a level triggers once the sprint has
-  // that many days (or fewer) left. critical < warning < notice.
-  const { daysRemaining: d, thresholds: t } = status;
-  if (d <= t.critical) return 'critical';
-  if (d <= t.warning) return 'warning';
-  if (d <= t.notice) return 'notice';
-  return 'calm';
+// Days left is inclusive of today, so 1 == the final day.
+function daysLabel(daysLeft: number): string {
+  if (daysLeft <= 1) return 'Last day';
+  return `${daysLeft} days left`;
 }
 
-function daysLabel(daysRemaining: number): string {
-  // daysRemaining is days left AFTER today, so 0 means today is the final day.
-  if (daysRemaining <= 0) return '0 days left';
-  if (daysRemaining === 1) return '1 day left';
-  return `${daysRemaining} days left`;
+// "ends Fri Jul 25", parsed as a LOCAL date so the weekday/day never shifts.
+function formatEndDate(ymd: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd);
+  if (!m) return '';
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  return d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
 }
 
 const STYLES: Record<Exclude<SprintLevel, 'idle'>, {
@@ -57,6 +55,16 @@ const STYLES: Record<Exclude<SprintLevel, 'idle'>, {
   animate: string;
   confirmBtn: string;
 }> = {
+  empty: {
+    icon: Plus,
+    banner: 'border-dashed border-slate-300 bg-slate-50/60 text-slate-600 dark:border-slate-700 dark:bg-slate-900/30 dark:text-slate-400',
+    iconWrap: 'bg-slate-200/70 text-slate-500 dark:bg-slate-800 dark:text-slate-400',
+    bar: 'bg-slate-300 dark:bg-slate-700',
+    track: 'bg-black/5 dark:bg-white/10',
+    badge: 'bg-slate-200 text-slate-600 dark:bg-slate-800 dark:text-slate-400',
+    animate: '',
+    confirmBtn: 'bg-slate-900 text-white hover:bg-slate-900/90 dark:bg-slate-100 dark:text-slate-900',
+  },
   done: {
     icon: CheckCircle2,
     banner: 'border-green-300 bg-green-50 text-green-800 dark:border-green-900/50 dark:bg-green-950/30 dark:text-green-300',
@@ -110,13 +118,17 @@ const STYLES: Record<Exclude<SprintLevel, 'idle'>, {
 };
 
 export function getSprintUrgency(status: SprintStatus): SprintUrgency {
-  const level = sprintLevel(status);
+  const level = status.level;
   const goal = status.goal.trim();
-  const dl = daysLabel(status.daysRemaining);
+  const dl = daysLabel(status.daysLeft);
+  const meta = status.configured
+    ? `Day ${status.dayOfSprint} of ${status.lengthDays} · ends ${formatEndDate(status.endDate)}`
+    : '';
 
   if (level === 'idle') {
     return {
-      level, show: false, icon: Target, headline: '', subline: '', daysLabel: dl,
+      level, show: false, isEmpty: false, icon: Target, headline: '', subline: '',
+      daysLabel: dl, metaLabel: meta,
       banner: '', iconWrap: '', bar: '', track: '', badge: '', animate: '', confirmBtn: '',
     };
   }
@@ -126,6 +138,10 @@ export function getSprintUrgency(status: SprintStatus): SprintUrgency {
   let headline: string;
   let subline: string;
   switch (level) {
+    case 'empty':
+      headline = 'Set this sprint’s goal';
+      subline = 'What’s the one thing this team wants to land this sprint?';
+      break;
     case 'done':
       headline = 'Sprint goal complete 🎉';
       subline = goal || 'Nice work — the goal is in the bag.';
@@ -143,7 +159,7 @@ export function getSprintUrgency(status: SprintStatus): SprintUrgency {
       subline = goal;
       break;
     case 'critical':
-      headline = status.daysRemaining <= 0
+      headline = status.daysLeft <= 1
         ? 'LAST CHANCE — the goal is STILL not done!'
         : "Time's almost up and the goal is NOT done!";
       subline = goal;
@@ -156,10 +172,12 @@ export function getSprintUrgency(status: SprintStatus): SprintUrgency {
   return {
     level,
     show: true,
+    isEmpty: level === 'empty',
     icon: s.icon,
     headline,
     subline,
     daysLabel: dl,
+    metaLabel: meta,
     banner: s.banner,
     iconWrap: s.iconWrap,
     bar: s.bar,

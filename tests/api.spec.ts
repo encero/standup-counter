@@ -340,7 +340,7 @@ test.describe('Sprint Goal API', () => {
     expect(data.hasGoal).toBe(false);
     expect(data.done).toBe(false);
     expect(data.lengthDays).toBe(14);
-    expect(data.thresholds).toEqual({ notice: 7, warning: 3, critical: 1 });
+    expect(data.level).toBe('idle');
   });
 
   test('PUT /api/:teamId/sprint configures the current sprint window', async () => {
@@ -350,17 +350,30 @@ test.describe('Sprint Goal API', () => {
       goal: 'Ship checkout v2',
       startDate: daysAgoISO(5),
       lengthDays: 14,
-      thresholds: { notice: 5, warning: 3, critical: 1 },
     });
 
     expect(status).toBe(200);
     expect(data.configured).toBe(true);
     expect(data.hasGoal).toBe(true);
     expect(data.goal).toBe('Ship checkout v2');
-    expect(data.daysRemaining).toBe(8); // 14 - 5, minus today (days left are counted after today)
-    expect(data.elapsedFraction).toBeGreaterThan(0.3);
+    expect(data.dayOfSprint).toBe(6);   // day 0 is the start date, so 5 days later is day 6
+    expect(data.daysLeft).toBe(9);      // 14 - 5 elapsed; includes today, so the last day reads 1
+    expect(data.elapsedFraction).toBeGreaterThan(0.4);
     expect(data.elapsedFraction).toBeLessThan(0.5);
-    expect(data.thresholds).toEqual({ notice: 5, warning: 3, critical: 1 });
+    expect(data.level).toBe('notice');  // >5 days left, but past the 0.4 elapsed nudge
+  });
+
+  test('PUT /api/:teamId/sprint goes critical 3 days before the end', async () => {
+    const teamId = createTeamInDb('Test Team');
+    // 14-day sprint started 11 days ago => day 12 => 3 days left (12,13,14) => critical.
+    const { data } = await api('PUT', `/api/${teamId}/sprint`, {
+      goal: 'Cut the release',
+      startDate: daysAgoISO(11),
+      lengthDays: 14,
+    });
+
+    expect(data.daysLeft).toBe(3);
+    expect(data.level).toBe('critical');
   });
 
   test('PUT /api/:teamId/sprint toggles the done flag', async () => {
@@ -369,21 +382,36 @@ test.describe('Sprint Goal API', () => {
 
     const done = await api('PUT', `/api/${teamId}/sprint`, { done: true });
     expect(done.data.done).toBe(true);
+    expect(done.data.level).toBe('done');
 
     const undone = await api('PUT', `/api/${teamId}/sprint`, { done: false });
     expect(undone.data.done).toBe(false);
   });
 
-  test('PUT /api/:teamId/sprint rejects malformed thresholds, falling back to defaults', async () => {
+  test('a goal does not leak into the next sprint window', async () => {
     const teamId = createTeamInDb('Test Team');
+    // Cadence started 20 days ago with 14-day sprints => we're in window index 1
+    // now (day 7 of the second sprint). Plant a goal in the PAST window only.
+    const start = daysAgoISO(20);
+    await api('PUT', `/api/${teamId}/sprint`, { startDate: start, lengthDays: 14 });
 
-    // Ascending day counts are invalid (notice must be the largest) and should be
-    // replaced by the defaults.
-    const { data } = await api('PUT', `/api/${teamId}/sprint`, {
-      thresholds: { notice: 1, warning: 3, critical: 7 },
-    });
+    const db = new Database(TEST_DB_PATH);
+    db.prepare(
+      'INSERT INTO sprint_goals (team_id, start_date, goal, length_days, set_at, done_at) VALUES (?, ?, ?, ?, ?, NULL)'
+    ).run(teamId, start, 'Old window goal', 14, Date.now());
+    db.close();
 
-    expect(data.thresholds).toEqual({ notice: 7, warning: 3, critical: 1 });
+    // The current window is a different start date, so it has no goal: the banner
+    // shows the "set a goal" (empty) state rather than the stale one.
+    const { data } = await api('GET', `/api/${teamId}/sprint`);
+    expect(data.configured).toBe(true);
+    expect(data.hasGoal).toBe(false);
+    expect(data.goal).toBe('');
+    expect(data.level).toBe('empty');
+
+    // The old goal is still archived in the history.
+    const history = await api('GET', `/api/${teamId}/sprint/history`);
+    expect(history.data.some((g: { goal: string }) => g.goal === 'Old window goal')).toBe(true);
   });
 });
 

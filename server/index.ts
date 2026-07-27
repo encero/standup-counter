@@ -321,92 +321,109 @@ function updateStandupAggregate(standupId: string, teamId: string) {
 // --- Sprint goal tracking ---------------------------------------------------
 const DAY_MS = 24 * 60 * 60 * 1000;
 
+// Server-derived urgency. The client maps this to colours/copy but does NO date
+// math or threshold logic of its own — the whole rule lives here.
+//   idle    — no valid cadence configured (banner hidden)
+//   empty   — cadence set but this window has no goal yet ("set a goal" prompt)
+//   calm/notice/warning/critical — goal set, not done, escalating toward the end
+//   done    — goal completed this window
+type SprintLevel = 'idle' | 'empty' | 'calm' | 'notice' | 'warning' | 'critical' | 'done';
+
 interface SprintStatus {
   configured: boolean;      // a valid start date + interval is set
-  goal: string;             // free-text goal description
+  goal: string;             // this window's goal ('' when none set yet)
   hasGoal: boolean;         // goal text is non-empty
   lengthDays: number;       // sprint interval in calendar days
-  startDate: string;        // raw 'YYYY-MM-DD' anchor from config
-  sprintStart: number;      // ms — start of the CURRENT sprint window
-  sprintEnd: number;        // ms — end of the current window (exclusive)
+  startDate: string;        // raw 'YYYY-MM-DD' cadence anchor from config
+  windowStart: string;      // 'YYYY-MM-DD' start of the CURRENT window (goal key)
+  endDate: string;          // 'YYYY-MM-DD' last day of the current window
+  dayOfSprint: number;      // 1-based day within the window (1 == first day)
+  daysLeft: number;         // whole calendar days left INCLUDING today (1 == last day)
   elapsedFraction: number;  // 0..1 progress through the current window
-  daysRemaining: number;    // whole calendar days left AFTER today (0 on the final day)
-  done: boolean;            // goal marked done within the current window
-  thresholds: SprintThresholds; // days-remaining cutoffs for each urgency level
+  done: boolean;            // goal marked done in the current window
+  level: SprintLevel;       // fully-derived urgency
 }
 
-// Day counts at which each urgency level kicks in: a level triggers once the
-// sprint has `daysRemaining <= threshold` days left. notice triggers earliest
-// (most days left), critical latest, so notice > warning > critical >= 1.
-interface SprintThresholds {
-  notice: number;   // calm -> notice
-  warning: number;  // notice -> warning
-  critical: number; // warning -> critical
+// Fixed, un-configurable urgency cutoffs (days left, inclusive of today):
+//   critical fires with 3 days left — i.e. the goal isn't done 3 days before the
+//   sprint ends — matching how teams actually think about the deadline.
+const CRITICAL_DAYS = 3;
+const WARNING_DAYS = 5;
+const NOTICE_FRACTION = 0.4; // roughly the back-half start, for the soft nudge
+
+function deriveLevel(s: {
+  configured: boolean; hasGoal: boolean; done: boolean; daysLeft: number; elapsedFraction: number;
+}): SprintLevel {
+  if (!s.configured) return 'idle';
+  if (!s.hasGoal) return 'empty';
+  if (s.done) return 'done';
+  if (s.daysLeft <= CRITICAL_DAYS) return 'critical';
+  if (s.daysLeft <= WARNING_DAYS) return 'warning';
+  if (s.elapsedFraction >= NOTICE_FRACTION) return 'notice';
+  return 'calm';
 }
 
-const DEFAULT_THRESHOLDS: SprintThresholds = { notice: 7, warning: 3, critical: 1 };
-
-// Parse "7,3,1" into descending day counts, falling back to defaults on any
-// malformed/out-of-order/out-of-range input so the client always gets sane cutoffs.
-function parseThresholds(raw: string | null | undefined): SprintThresholds {
-  const parts = (raw || '').split(',').map(s => Number(s.trim()));
-  if (parts.length !== 3 || parts.some(n => !Number.isInteger(n) || n < 1 || n > 365)) {
-    return DEFAULT_THRESHOLDS;
-  }
-  const [notice, warning, critical] = parts;
-  if (!(notice > warning && warning > critical)) return DEFAULT_THRESHOLDS;
-  return { notice, warning, critical };
+// A local calendar date (its Y/M/D) mapped to a UTC-midnight timestamp. Doing all
+// whole-day arithmetic in this space keeps sprint boundaries pinned to local
+// midnight and immune to DST shifts (every window is exactly N UTC-days wide).
+function localDateToUTC(now: number): number {
+  const n = new Date(now);
+  return Date.UTC(n.getFullYear(), n.getMonth(), n.getDate());
+}
+function ymdFromUTC(utcMs: number): string {
+  return new Date(utcMs).toISOString().slice(0, 10);
 }
 
-// Derive the current sprint window by repeating the interval from the anchor
-// date. "done" is stored as a timestamp and only counts for the window it falls
-// in, so it auto-resets each new sprint with no scheduled job.
-function computeSprintStatus(teamId: string): SprintStatus {
+// Derive the current sprint window by repeating the interval from the anchor date,
+// counting whole calendar days. The goal + done state are looked up per-window
+// from sprint_goals keyed by the window start date, so a rollover automatically
+// clears the goal (new window == no row) with no scheduled job.
+function computeSprintStatus(teamId: string, now: number = Date.now()): SprintStatus {
   const team = db.prepare(
-    'SELECT sprint_start, sprint_length_days, sprint_goal, sprint_goal_done_at, sprint_thresholds FROM teams WHERE id = ?'
-  ).get(teamId) as {
-    sprint_start: string | null;
-    sprint_length_days: number | null;
-    sprint_goal: string | null;
-    sprint_goal_done_at: number | null;
-    sprint_thresholds: string | null;
-  } | undefined;
+    'SELECT sprint_start, sprint_length_days FROM teams WHERE id = ?'
+  ).get(teamId) as { sprint_start: string | null; sprint_length_days: number | null } | undefined;
 
-  const goal = team?.sprint_goal || '';
-  const hasGoal = goal.trim().length > 0;
   const startDate = team?.sprint_start || '';
   const rawLength = team?.sprint_length_days;
   const lengthDays = Number.isFinite(rawLength) && (rawLength as number) >= 1 ? (rawLength as number) : 14;
-  const doneAt = team?.sprint_goal_done_at ?? null;
-  const thresholds = parseThresholds(team?.sprint_thresholds);
 
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(startDate);
   if (!m) {
     return {
-      configured: false, goal, hasGoal, lengthDays, startDate,
-      sprintStart: 0, sprintEnd: 0, elapsedFraction: 0, daysRemaining: 0, done: false, thresholds,
+      configured: false, goal: '', hasGoal: false, lengthDays, startDate,
+      windowStart: '', endDate: '', dayOfSprint: 0, daysLeft: 0,
+      elapsedFraction: 0, done: false, level: 'idle',
     };
   }
 
-  // Local midnight of the anchor date.
-  const anchorMs = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3])).getTime();
-  const lenMs = lengthDays * DAY_MS;
-  const now = Date.now();
+  const anchorUTC = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+  const todayUTC = localDateToUTC(now);
+  const daysSince = Math.floor((todayUTC - anchorUTC) / DAY_MS);
 
-  // Clamp to sprint 0 before the anchor so a future start date doesn't go negative.
-  const index = Math.max(0, Math.floor((now - anchorMs) / lenMs));
-  const sprintStart = anchorMs + index * lenMs;
-  const sprintEnd = sprintStart + lenMs;
-  const elapsedFraction = Math.min(1, Math.max(0, (now - sprintStart) / lenMs));
-  // Count whole days left AFTER today: floor, not ceil, so today's partially
-  // elapsed day is not counted as remaining. A 14-day sprint that starts Tuesday
-  // ends the second Monday, and that Monday reads 0 days left.
-  const daysRemaining = Math.max(0, Math.floor((sprintEnd - now) / DAY_MS));
-  const done = doneAt != null && doneAt >= sprintStart && doneAt < sprintEnd;
+  // Clamp to sprint 0 before the anchor so a future start date reads as "day 1".
+  const index = Math.max(0, Math.floor(daysSince / lengthDays));
+  const windowStartUTC = anchorUTC + index * lengthDays * DAY_MS;
+  const lastDayUTC = windowStartUTC + (lengthDays - 1) * DAY_MS;
+
+  const dayIndex = Math.max(0, daysSince - index * lengthDays); // 0-based day in window
+  const dayOfSprint = dayIndex + 1;                              // 1-based
+  const daysLeft = Math.max(0, lengthDays - dayIndex);           // includes today: last day == 1
+  const elapsedFraction = Math.min(1, Math.max(0, dayOfSprint / lengthDays));
+  const windowStart = ymdFromUTC(windowStartUTC);
+  const endDate = ymdFromUTC(lastDayUTC);
+
+  const row = db.prepare(
+    'SELECT goal, done_at FROM sprint_goals WHERE team_id = ? AND start_date = ?'
+  ).get(teamId, windowStart) as { goal: string; done_at: number | null } | undefined;
+
+  const goal = row?.goal || '';
+  const hasGoal = goal.trim().length > 0;
+  const done = hasGoal && row?.done_at != null;
+  const level = deriveLevel({ configured: true, hasGoal, done, daysLeft, elapsedFraction });
 
   return {
     configured: true, goal, hasGoal, lengthDays, startDate,
-    sprintStart, sprintEnd, elapsedFraction, daysRemaining, done, thresholds,
+    windowStart, endDate, dayOfSprint, daysLeft, elapsedFraction, done, level,
   };
 }
 
@@ -702,13 +719,21 @@ teamRouter.get('/sprint', (req, res) => {
   res.json(computeSprintStatus(req.params.teamId));
 });
 
+// Archived + current goals, most recent first. Powers the "past goals" list.
+teamRouter.get('/sprint/history', (req, res) => {
+  const rows = db.prepare(
+    `SELECT start_date as startDate, goal, length_days as lengthDays, set_at as setAt, done_at as doneAt
+     FROM sprint_goals WHERE team_id = ? ORDER BY start_date DESC LIMIT 50`
+  ).all(req.params.teamId) as Array<{ startDate: string; goal: string; lengthDays: number; setAt: number; doneAt: number | null }>;
+  res.json(rows.map(r => ({ ...r, done: r.doneAt != null })));
+});
+
 teamRouter.put('/sprint', (req, res) => {
   const { teamId } = req.params;
-  const { goal, startDate, lengthDays, done, thresholds } = req.body;
+  const { goal, startDate, lengthDays, done } = req.body;
 
-  if (goal !== undefined) {
-    db.prepare('UPDATE teams SET sprint_goal = ? WHERE id = ?').run(String(goal).slice(0, 200), teamId);
-  }
+  // Apply cadence changes FIRST so any goal/done in the same request binds to the
+  // (possibly new) current window resolved below.
   if (startDate !== undefined) {
     const v = typeof startDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(startDate) ? startDate : '';
     db.prepare('UPDATE teams SET sprint_start = ? WHERE id = ?').run(v, teamId);
@@ -717,16 +742,33 @@ teamRouter.put('/sprint', (req, res) => {
     const n = Math.min(60, Math.max(1, Math.round(Number(lengthDays) || 14)));
     db.prepare('UPDATE teams SET sprint_length_days = ? WHERE id = ?').run(n, teamId);
   }
-  if (thresholds !== undefined) {
-    // Accept either {notice,warning,critical} or [n,w,c]; persist normalized + validated.
-    const t = Array.isArray(thresholds)
-      ? parseThresholds(thresholds.join(','))
-      : parseThresholds(`${thresholds?.notice},${thresholds?.warning},${thresholds?.critical}`);
-    db.prepare('UPDATE teams SET sprint_thresholds = ? WHERE id = ?')
-      .run(`${t.notice},${t.warning},${t.critical}`, teamId);
+
+  // Resolve the current window from the now-current cadence.
+  const current = computeSprintStatus(teamId);
+
+  if (goal !== undefined && current.configured) {
+    const text = String(goal).slice(0, 200);
+    if (text.trim().length === 0) {
+      // Clear this window's goal (and its done flag) — banner returns to the
+      // "set a goal" prompt. Past windows' goals are untouched.
+      db.prepare('DELETE FROM sprint_goals WHERE team_id = ? AND start_date = ?')
+        .run(teamId, current.windowStart);
+    } else {
+      // Upsert this window's goal. Editing the text preserves an existing done_at
+      // (set_at is only stamped on first insert) so a wording tweak doesn't
+      // un-complete a finished goal.
+      db.prepare(
+        `INSERT INTO sprint_goals (team_id, start_date, goal, length_days, set_at, done_at)
+         VALUES (?, ?, ?, ?, ?, NULL)
+         ON CONFLICT(team_id, start_date) DO UPDATE SET goal = excluded.goal, length_days = excluded.length_days`
+      ).run(teamId, current.windowStart, text, current.lengthDays, Date.now());
+    }
   }
-  if (done !== undefined) {
-    db.prepare('UPDATE teams SET sprint_goal_done_at = ? WHERE id = ?').run(done ? Date.now() : null, teamId);
+
+  if (done !== undefined && current.configured) {
+    // Only meaningful when this window has a goal; a no-op otherwise.
+    db.prepare('UPDATE sprint_goals SET done_at = ? WHERE team_id = ? AND start_date = ?')
+      .run(done ? Date.now() : null, teamId, current.windowStart);
   }
 
   const status = computeSprintStatus(teamId);

@@ -232,6 +232,62 @@ function runMigrations() {
     db.prepare("INSERT INTO _migrations (name) VALUES (?)").run('008_add_pr_status');
   }
 
+  // Migration 009: Per-window sprint goals, bound to the window they belong to.
+  // The old model kept a single sticky sprint_goal on the team that never rolled,
+  // so an ended sprint's goal leaked into the next window. Now each goal lives in
+  // its own row keyed by the window START DATE; when the sprint rolls the current
+  // window has no row and the banner prompts for a fresh goal, while past goals
+  // stay archived. done_at moves onto the row too, so completion is per-window.
+  if (!appliedMigrations.has('009_sprint_goal_windows')) {
+    console.log('📦 Running migration 009: Per-window sprint goals...');
+
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS sprint_goals (
+        team_id     TEXT NOT NULL,
+        start_date  TEXT NOT NULL,   -- YYYY-MM-DD window start; the binding key
+        goal        TEXT NOT NULL,
+        length_days INTEGER NOT NULL,
+        set_at      INTEGER NOT NULL,
+        done_at     INTEGER,
+        PRIMARY KEY (team_id, start_date)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_sprint_goals_team ON sprint_goals(team_id);
+    `);
+
+    // Backfill: bind each team's existing goal to its CURRENT window so nothing is
+    // lost. It then expires naturally on the next rollover. Window math mirrors the
+    // server's: map local calendar dates to UTC-midnight so whole-day counting is
+    // DST-safe.
+    const DAY = 86_400_000;
+    const now = Date.now();
+    const nd = new Date(now);
+    const todayUTC = Date.UTC(nd.getFullYear(), nd.getMonth(), nd.getDate());
+
+    const teams = db.prepare(
+      "SELECT id, sprint_start, sprint_length_days, sprint_goal, sprint_goal_done_at FROM teams WHERE sprint_goal IS NOT NULL AND sprint_goal != ''"
+    ).all() as Array<{ id: string; sprint_start: string | null; sprint_length_days: number | null; sprint_goal: string; sprint_goal_done_at: number | null }>;
+
+    const insert = db.prepare(
+      'INSERT OR IGNORE INTO sprint_goals (team_id, start_date, goal, length_days, set_at, done_at) VALUES (?, ?, ?, ?, ?, ?)'
+    );
+
+    for (const t of teams) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(t.sprint_start || '');
+      if (!m) continue;
+      const len = Number.isFinite(t.sprint_length_days) && (t.sprint_length_days as number) >= 1 ? (t.sprint_length_days as number) : 14;
+      const anchorUTC = Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3]));
+      const daysSince = Math.floor((todayUTC - anchorUTC) / DAY);
+      const index = Math.max(0, Math.floor(daysSince / len));
+      const startYMD = new Date(anchorUTC + index * len * DAY).toISOString().slice(0, 10);
+      // Preserve completion: if the current goal was marked done, keep it done for
+      // this window (it's the window it was completed in).
+      insert.run(t.id, startYMD, t.sprint_goal, len, now, t.sprint_goal_done_at ?? null);
+    }
+
+    db.prepare("INSERT INTO _migrations (name) VALUES (?)").run('009_sprint_goal_windows');
+  }
+
   console.log('✅ Database migrations complete');
 }
 

@@ -11,14 +11,13 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog';
 import { ConnectionManager } from '@/lib/ConnectionManager';
-import type { TeamMember, SprintStatus } from '@/types/standup';
+import type { TeamMember, SprintStatus, SprintGoalHistoryEntry } from '@/types/standup';
 
 interface SprintPatch {
   goal?: string;
   startDate?: string;
   lengthDays?: number;
   done?: boolean;
-  thresholds?: { notice: number; warning: number; critical: number };
 }
 
 interface SettingsProps {
@@ -58,13 +57,12 @@ export function Settings({
   const [prTokenCopied, setPrTokenCopied] = useState(false);
   const [prTokenBusy, setPrTokenBusy] = useState(false);
 
-  // Sprint goal draft — seeded from the live status and saved as one block.
-  const [sprintGoal, setSprintGoal] = useState('');
+  // Sprint cadence draft — seeded from the live status. The goal itself is set on
+  // the banner (per-window), not here; Settings only owns the recurring cadence.
   const [sprintStart, setSprintStart] = useState('');
   const [sprintLength, setSprintLength] = useState(14);
-  // Urgency cutoffs in days-remaining (notice > warning > critical >= 1).
-  const [thresholds, setThresholds] = useState({ notice: 7, warning: 3, critical: 1 });
   const [sprintSaved, setSprintSaved] = useState(false);
+  const [pastGoals, setPastGoals] = useState<SprintGoalHistoryEntry[]>([]);
 
   // Re-seed the draft whenever a new status snapshot arrives (initial load or a
   // live broadcast). Adjusting state during render is React's recommended way to
@@ -72,37 +70,17 @@ export function Settings({
   const [seededFrom, setSeededFrom] = useState<SprintStatus | null>(null);
   if (sprintStatus && sprintStatus !== seededFrom) {
     setSeededFrom(sprintStatus);
-    setSprintGoal(sprintStatus.goal);
     setSprintStart(sprintStatus.startDate);
     setSprintLength(sprintStatus.lengthDays);
-    setThresholds({ ...sprintStatus.thresholds });
   }
 
-  const thresholdsValid =
-    thresholds.critical >= 1 &&
-    thresholds.critical < thresholds.warning &&
-    thresholds.warning < thresholds.notice;
-
   const handleSaveSprint = () => {
-    if (!thresholdsValid) return;
-    onUpdateSprint({
-      goal: sprintGoal,
-      startDate: sprintStart,
-      lengthDays: sprintLength,
-      thresholds: { ...thresholds },
-    })
+    onUpdateSprint({ startDate: sprintStart, lengthDays: sprintLength })
       .then(() => {
         setSprintSaved(true);
         setTimeout(() => setSprintSaved(false), 2000);
       })
       .catch(console.error);
-  };
-
-  // Clear just the goal (and its done flag) — the banner disappears while the
-  // team's sprint cadence/thresholds stay configured for the next goal.
-  const handleClearSprint = () => {
-    setSprintGoal('');
-    onUpdateSprint({ goal: '', done: false }).catch(console.error);
   };
 
   // Load settings from server via ConnectionManager
@@ -118,6 +96,15 @@ export function Settings({
       })
       .catch(console.error);
   }, [teamId, onExpectedSecondsChange]);
+
+  // Load the sprint-goal archive. Refetch whenever the live status changes (a goal
+  // was set, completed, or the window rolled) so the "past goals" list stays fresh.
+  useEffect(() => {
+    if (!teamId) return;
+    ConnectionManager.get<SprintGoalHistoryEntry[]>(`/api/${teamId}/sprint/history`)
+      .then(setPastGoals)
+      .catch(console.error);
+  }, [teamId, sprintStatus]);
 
   // Generate/rotate the publisher ingest token. The server returns the raw
   // token once; any previously issued token stops working immediately.
@@ -222,21 +209,14 @@ export function Settings({
             </div>
           </div>
 
-          {/* Sprint Goal */}
+          {/* Sprint cadence — set once. The goal itself is set on the banner. */}
           <div className="space-y-3 border-t pt-4">
             <div>
-              <label className="text-sm font-medium">Sprint goal</label>
+              <label className="text-sm font-medium">Sprint cadence</label>
               <p className="text-xs text-muted-foreground">
-                Shown on the main page; the alert gets louder as the sprint end nears with the goal unmet.
+                When your sprints start and how long they run. Set the goal itself on the main-page banner — it rolls over automatically each sprint.
               </p>
             </div>
-
-            <Input
-              placeholder="e.g. Ship checkout v2"
-              value={sprintGoal}
-              maxLength={200}
-              onChange={(e) => setSprintGoal(e.target.value)}
-            />
 
             <div className="flex flex-wrap items-end gap-3">
               <div className="space-y-1">
@@ -249,16 +229,21 @@ export function Settings({
                 />
               </div>
               <div className="space-y-1">
-                <label className="text-xs text-muted-foreground">Length (days)</label>
+                <label className="text-xs text-muted-foreground">Length</label>
                 <div className="flex items-center gap-1.5">
-                  {[7, 14, 21, 28].map((d) => (
+                  {[
+                    [7, '1w'],
+                    [14, '2w'],
+                    [21, '3w'],
+                    [28, '4w'],
+                  ].map(([d, label]) => (
                     <Button
                       key={d}
                       variant={sprintLength === d ? 'default' : 'outline'}
                       size="sm"
-                      onClick={() => setSprintLength(d)}
+                      onClick={() => setSprintLength(d as number)}
                     >
-                      {d}
+                      {label}
                     </Button>
                   ))}
                   <Input
@@ -273,62 +258,40 @@ export function Settings({
               </div>
             </div>
 
-            {/* Urgency thresholds — escalate when this many days (or fewer) remain */}
-            <div className="space-y-1.5">
-              <label className="text-xs text-muted-foreground">
-                Escalate when days left ≤
-              </label>
-              <div className="grid grid-cols-3 gap-2">
-                {([
-                  ['notice', 'Notice'],
-                  ['warning', 'Warning'],
-                  ['critical', 'Critical'],
-                ] as const).map(([key, label]) => (
-                  <div key={key} className="space-y-1">
-                    <span className="block text-[11px] text-muted-foreground">{label}</span>
-                    <div className="flex items-center gap-1">
-                      <Input
-                        type="number"
-                        min={1}
-                        max={365}
-                        value={thresholds[key]}
-                        onChange={(e) =>
-                          setThresholds((t) => ({ ...t, [key]: Math.min(365, Math.max(1, Math.round(Number(e.target.value)))) }))
-                        }
-                        className="text-center text-sm"
-                      />
-                      <span className="text-xs text-muted-foreground">d</span>
-                    </div>
-                  </div>
-                ))}
-              </div>
-              {!thresholdsValid && (
-                <p className="text-xs text-destructive">
-                  Days must decrease: notice &gt; warning &gt; critical ≥ 1.
-                </p>
-              )}
-            </div>
+            <Button
+              onClick={handleSaveSprint}
+              size="sm"
+              variant={sprintSaved ? 'outline' : 'default'}
+            >
+              {sprintSaved ? '✓ Saved' : 'Save cadence'}
+            </Button>
 
-            <div className="flex items-center gap-2">
-              <Button
-                onClick={handleSaveSprint}
-                size="sm"
-                variant={sprintSaved ? 'outline' : 'default'}
-                disabled={!thresholdsValid}
-              >
-                {sprintSaved ? '✓ Saved' : 'Save sprint settings'}
-              </Button>
-              {sprintGoal.trim() && (
-                <Button
-                  onClick={handleClearSprint}
-                  size="sm"
-                  variant="ghost"
-                  className="text-muted-foreground"
-                >
-                  Clear goal
-                </Button>
-              )}
-            </div>
+            {/* Past goals archive */}
+            {(() => {
+              const past = pastGoals.filter(g => g.startDate !== sprintStatus?.windowStart);
+              if (past.length === 0) return null;
+              return (
+                <div className="space-y-1.5 pt-1">
+                  <label className="text-xs font-medium text-muted-foreground">Past goals</label>
+                  <div className="max-h-40 space-y-1 overflow-auto">
+                    {past.map((g) => (
+                      <div
+                        key={g.startDate}
+                        className="flex items-center gap-2 rounded bg-muted/50 px-2 py-1.5 text-sm"
+                      >
+                        <span className="shrink-0" title={g.done ? 'Completed' : 'Not completed'}>
+                          {g.done ? '✅' : '⬜'}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate">{g.goal}</span>
+                        <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+                          {g.startDate}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
           </div>
 
           {/* Team Members */}

@@ -22,21 +22,35 @@ function createTeamInDb(name: string, members: string[] = []): string {
   return teamId;
 }
 
-// Helper to configure a team's sprint goal directly in the database. The sprint_*
-// columns are added by migration 007 when the test server boots, so they exist by
-// the time these UI tests run.
+// Helper to configure a team's sprint cadence + current-window goal directly in
+// the database. Cadence lives on the team; the goal lives in sprint_goals keyed by
+// the window start date (migration 009). This computes the current window start the
+// same way the server does (local calendar dates mapped to UTC midnight).
 function configureSprintInDb(
   teamId: string,
-  opts: { goal: string; startDaysAgo: number; lengthDays?: number; thresholds?: string; doneAt?: number | null }
+  opts: { goal: string; startDaysAgo: number; lengthDays?: number; doneAt?: number | null }
 ): void {
   const db = new Database(TEST_DB_PATH);
+  const len = opts.lengthDays ?? 14;
+  const DAY = 86_400_000;
+
   const d = new Date();
   d.setHours(0, 0, 0, 0);
   d.setDate(d.getDate() - opts.startDaysAgo);
   const startDate = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+  const anchorUTC = Date.UTC(d.getFullYear(), d.getMonth(), d.getDate());
+  const t = new Date();
+  const todayUTC = Date.UTC(t.getFullYear(), t.getMonth(), t.getDate());
+  const index = Math.max(0, Math.floor((todayUTC - anchorUTC) / DAY / len));
+  const windowStart = new Date(anchorUTC + index * len * DAY).toISOString().slice(0, 10);
+
+  db.prepare('UPDATE teams SET sprint_start = ?, sprint_length_days = ? WHERE id = ?')
+    .run(startDate, len, teamId);
   db.prepare(
-    `UPDATE teams SET sprint_goal = ?, sprint_start = ?, sprint_length_days = ?, sprint_thresholds = ?, sprint_goal_done_at = ? WHERE id = ?`
-  ).run(opts.goal, startDate, opts.lengthDays ?? 14, opts.thresholds ?? '7,3,1', opts.doneAt ?? null, teamId);
+    `INSERT OR REPLACE INTO sprint_goals (team_id, start_date, goal, length_days, set_at, done_at)
+     VALUES (?, ?, ?, ?, ?, ?)`
+  ).run(teamId, windowStart, opts.goal, len, Date.now(), opts.doneAt ?? null);
   db.close();
 }
 
@@ -590,20 +604,32 @@ test.describe('Sprint Goal', () => {
     await expect(page.getByText(/Sprint goal complete/)).toHaveCount(0);
   });
 
+  test('empty banner prompts to set a goal when the cadence is set but no goal exists', async ({ page }) => {
+    const teamId = createTeamInDb('Empty Sprint Team', ['Alice']);
+    // Configure cadence only (no goal row) by planting a goal then clearing it.
+    configureSprintInDb(teamId, { goal: 'placeholder', startDaysAgo: 0, lengthDays: 14 });
+    const db = new Database(TEST_DB_PATH);
+    db.prepare('DELETE FROM sprint_goals WHERE team_id = ?').run(teamId);
+    db.close();
+    await page.goto(`/${teamId}`);
+
+    await expect(page.getByText('Set this sprint’s goal')).toBeVisible({ timeout: 10000 });
+  });
+
   test('calm banner shows the goal early in the sprint', async ({ page }) => {
     const teamId = createTeamInDb('Calm Sprint Team', ['Alice']);
-    // Day 0 of a 14-day sprint => 13 days left after today, well above the notice threshold (7).
+    // Day 1 of a 14-day sprint => 14 days left (inclusive of today), well clear of any escalation.
     configureSprintInDb(teamId, { goal: 'Ship checkout v2', startDaysAgo: 0, lengthDays: 14 });
     await page.goto(`/${teamId}`);
 
     await expect(page.getByText('Sprint goal in progress')).toBeVisible({ timeout: 10000 });
     await expect(page.getByText('Ship checkout v2')).toBeVisible();
-    await expect(page.getByText('13 days left')).toBeVisible();
+    await expect(page.getByText('14 days left')).toBeVisible();
   });
 
   test('banner escalates to an aggressive critical alert on the last day', async ({ page }) => {
     const teamId = createTeamInDb('Critical Sprint Team', ['Alice']);
-    // Day 13 of a 14-day sprint => the final day => 0 days left => critical (<= threshold 1).
+    // Day 14 of a 14-day sprint => the final day => 1 day left ("Last day") => critical.
     configureSprintInDb(teamId, { goal: 'Cut the release', startDaysAgo: 13, lengthDays: 14 });
     await page.goto(`/${teamId}`);
 
@@ -611,7 +637,7 @@ test.describe('Sprint Goal', () => {
     await expect(alert).toBeVisible({ timeout: 10000 });
     await expect(alert).toContainText('the goal is STILL not done');
     await expect(alert).toContainText('Cut the release');
-    await expect(page.getByText('0 days left')).toBeVisible();
+    await expect(page.getByText('Last day')).toBeVisible();
     // The critical level applies the angry shake animation.
     await expect(alert).toHaveClass(/animate-angry-shake/);
   });
@@ -673,11 +699,11 @@ test.describe('Sprint Goal', () => {
     // Banner now reflects the completed goal (synced live via the sprint broadcast).
     await expect(page.getByText('Sprint goal complete 🎉')).toBeVisible({ timeout: 5000 });
 
-    // And the done flag is persisted.
+    // And the done flag is persisted on the current window's goal row.
     const db = new Database(TEST_DB_PATH);
-    const row = db.prepare('SELECT sprint_goal_done_at FROM teams WHERE id = ?').get(teamId) as { sprint_goal_done_at: number | null };
+    const row = db.prepare('SELECT done_at FROM sprint_goals WHERE team_id = ?').get(teamId) as { done_at: number | null };
     db.close();
-    expect(row.sprint_goal_done_at).not.toBeNull();
+    expect(row.done_at).not.toBeNull();
   });
 
   test('goal check is skipped when the goal is already marked done', async ({ page }) => {

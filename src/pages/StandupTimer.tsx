@@ -218,8 +218,12 @@ export function StandupTimer() {
           </div>
         </div>
 
-        {/* Sprint Goal — escalating signal of how close the team is to the goal */}
-        <SprintGoalBanner status={sprintStatus} />
+        {/* Sprint Goal — escalating signal of how close the team is to the goal,
+            and where this window's goal is set/edited inline. */}
+        <SprintGoalBanner
+          status={sprintStatus}
+          onSetGoal={(goal) => { updateSprint({ goal }); }}
+        />
 
         {/* Timer Card — compact linear header on narrow/sidebar widths,
             full radial dial on wider screens. */}

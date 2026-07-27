@@ -470,17 +470,22 @@ test.describe('Sprint Rollover on Standup Start', () => {
 
   // The behavior we're locking: a long-lived client (wall display / sidebar)
   // can sit open across a sprint boundary with no one reloading at midnight.
-  // Starting a standup must push fresh sprint status so its banner rolls over.
+  // Starting a standup must push fresh sprint status so its banner rolls over —
+  // and crucially the PRIOR window's goal must not leak into the new one.
   test('start pushes current-window sprint status to connected clients', async () => {
     const teamId = createTeamInDb('Rollover Team', ['Alice']);
 
-    // 14-day cadence anchored 20 days ago => "now" sits in the SECOND window
-    // [day-6, day+8). The goal was marked done 15 days ago, inside the FIRST
-    // window, so it must NOT count as done for the current one.
+    // 14-day cadence anchored 20 days ago => "now" sits in the SECOND window,
+    // whose start is 6 days ago. The old goal (marked done) lives in the FIRST
+    // window only, so the current window must read as empty — not carried over.
+    const anchor = daysAgoISO(20);
+    const firstWindowStart = anchor; // window 0 start == the anchor
     const db = new Database(TEST_DB_PATH);
+    db.prepare('UPDATE teams SET sprint_start = ?, sprint_length_days = 14 WHERE id = ?')
+      .run(anchor, teamId);
     db.prepare(
-      'UPDATE teams SET sprint_goal = ?, sprint_start = ?, sprint_length_days = 14, sprint_goal_done_at = ? WHERE id = ?'
-    ).run('Carryover goal', daysAgoISO(20), Date.now() - 15 * DAY, teamId);
+      'INSERT INTO sprint_goals (team_id, start_date, goal, length_days, set_at, done_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(teamId, firstWindowStart, 'Carryover goal', 14, Date.now() - 15 * DAY, Date.now() - 15 * DAY);
     db.close();
 
     const { ws } = await connectWebSocket(teamId);
@@ -489,17 +494,18 @@ test.describe('Sprint Rollover on Standup Start', () => {
     const sprintPromise = waitForMessage(ws, 'sprint');
     ws.send(JSON.stringify({ type: 'start', speaker: { id: crypto.randomUUID(), name: 'Alice' } }));
     const sprint = (await sprintPromise).sprint as {
-      configured: boolean; hasGoal: boolean; done: boolean; daysRemaining: number;
+      configured: boolean; hasGoal: boolean; done: boolean; daysLeft: number; level: string;
     };
 
     expect(sprint.configured).toBe(true);
-    expect(sprint.hasGoal).toBe(true);
-    // Rolled into the current window: the prior window's done flag is cleared...
+    // The prior window's goal does NOT carry over — the new window is empty.
+    expect(sprint.hasGoal).toBe(false);
     expect(sprint.done).toBe(false);
-    // ...and days-remaining reflects the current window, not the expired one
-    // (which would have read 0).
-    expect(sprint.daysRemaining).toBeGreaterThan(0);
-    expect(sprint.daysRemaining).toBeLessThanOrEqual(14);
+    expect(sprint.level).toBe('empty');
+    // Days-left reflects the CURRENT window (day 7 of 14 => 8 left), not the
+    // expired one.
+    expect(sprint.daysLeft).toBeGreaterThan(0);
+    expect(sprint.daysLeft).toBeLessThanOrEqual(14);
 
     ws.close();
   });

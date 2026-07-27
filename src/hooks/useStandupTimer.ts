@@ -299,7 +299,6 @@ export function useStandupTimer(teamId: string) {
     startDate?: string;
     lengthDays?: number;
     done?: boolean;
-    thresholds?: { notice: number; warning: number; critical: number };
   }) => {
     return ConnectionManager.put<SprintStatus>(`${API_URL}/sprint`, patch)
       .then(status => { setSprintStatus(status); return status; })
