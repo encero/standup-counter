@@ -15,15 +15,7 @@ spec:
       labels:
         app: standup-counter
     spec:
-      # Run as the image's unprivileged `node` user. fsGroup makes the volume
-      # group-writable for it, which also covers databases written by older
-      # root-running images.
       securityContext:
-        runAsUser: 1000
-        runAsGroup: 1000
-        runAsNonRoot: true
-        fsGroup: 1000
-        fsGroupChangePolicy: OnRootMismatch
         seccompProfile:
           type: RuntimeDefault
       containers:
@@ -47,10 +39,18 @@ spec:
             # Set to your team's zone (defaults to UTC if unset).
             # - name: TZ
             #   value: Europe/Prague
+          # The image's entrypoint starts as root only to chown the data
+          # directory (databases written by older root-running images, or copied
+          # in from elsewhere, aren't owned by `node`), then drops to the
+          # unprivileged `node` user via su-exec. This works on any volume type;
+          # pod-level runAsUser + fsGroup does not, because hostPath volumes
+          # (e.g. k3s local-path) ignore fsGroup. Only the capabilities that
+          # step needs are kept.
           securityContext:
             allowPrivilegeEscalation: false
             capabilities:
               drop: ["ALL"]
+              add: ["CHOWN", "SETUID", "SETGID"]
           volumeMounts:
             - name: db-storage
               mountPath: /data
