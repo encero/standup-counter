@@ -15,6 +15,17 @@ spec:
       labels:
         app: standup-counter
     spec:
+      # Run as the image's unprivileged `node` user. fsGroup makes the volume
+      # group-writable for it, which also covers databases written by older
+      # root-running images.
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        fsGroup: 1000
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: standup-counter
           image: standup-counter:latest
@@ -28,6 +39,18 @@ spec:
               value: /data/standup.db
             - name: NODE_ENV
               value: production
+            # Requests arrive through the ingress (one proxy hop); trust its
+            # X-Forwarded-For so rate limiting sees real client IPs.
+            - name: TRUST_PROXY
+              value: "1"
+            # Local timezone for standup dates and sprint-day rollover.
+            # Set to your team's zone (defaults to UTC if unset).
+            # - name: TZ
+            #   value: Europe/Prague
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
           volumeMounts:
             - name: db-storage
               mountPath: /data
@@ -40,13 +63,13 @@ spec:
               cpu: "500m"
           livenessProbe:
             httpGet:
-              path: /api/server-info
+              path: /healthz
               port: 3001
             initialDelaySeconds: 10
             periodSeconds: 30
           readinessProbe:
             httpGet:
-              path: /api/server-info
+              path: /healthz
               port: 3001
             initialDelaySeconds: 5
             periodSeconds: 10

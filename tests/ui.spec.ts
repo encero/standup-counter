@@ -793,3 +793,89 @@ test.describe('PR Publisher Token (Settings UI)', () => {
     await expect(page.getByRole('button', { name: 'Reset token' })).toBeVisible();
   });
 });
+
+test.describe('Session Recording Across Devices', () => {
+  function sessionsFor(teamId: string, name: string) {
+    const db = new Database(TEST_DB_PATH);
+    const rows = db.prepare('SELECT duration FROM sessions WHERE team_id = ? AND member_name = ?')
+      .all(teamId, name) as { duration: number }[];
+    db.close();
+    return rows;
+  }
+
+  test('two open timer pages record each turn once', async ({ browser }) => {
+    const teamId = createTeamInDb('Two Displays Team', ['Xena', 'Yuri']);
+    const context1 = await browser.newContext();
+    const context2 = await browser.newContext();
+    const page1 = await context1.newPage();
+    const page2 = await context2.newPage();
+
+    await page1.goto(`/${teamId}`);
+    await page2.goto(`/${teamId}`);
+    await expect(page1.getByText('Xena')).toBeVisible();
+    await expect(page2.getByText('Xena')).toBeVisible();
+    await page1.waitForTimeout(500);
+
+    await page1.getByRole('button', { name: /Xena/ }).click();
+    await expect(page2.getByText('Xena is speaking')).toBeVisible({ timeout: 10000 });
+    await page1.waitForTimeout(1500);
+    await page1.getByRole('button', { name: /Yuri/ }).click();
+    await expect(page2.getByText('Yuri is speaking')).toBeVisible({ timeout: 10000 });
+    await page1.waitForTimeout(500);
+
+    const rows = sessionsFor(teamId, 'Xena');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].duration).toBeGreaterThan(1000);
+    expect(rows[0].duration).toBeLessThan(3000);
+
+    await context1.close();
+    await context2.close();
+  });
+
+  test('ending the standup from the control page records the last speaker', async ({ browser }) => {
+    const teamId = createTeamInDb('Phone End Team', ['Zoe']);
+    const displayContext = await browser.newContext();
+    const phoneContext = await browser.newContext();
+    const display = await displayContext.newPage();
+    const phone = await phoneContext.newPage();
+
+    await display.goto(`/${teamId}`);
+    await phone.goto(`/${teamId}/control`);
+    await expect(display.getByText('Zoe')).toBeVisible();
+    await expect(phone.getByText('Connected')).toBeVisible({ timeout: 10000 });
+
+    await phone.getByRole('button', { name: /Zoe/ }).click();
+    await expect(display.getByText('Zoe is speaking')).toBeVisible({ timeout: 10000 });
+    await phone.waitForTimeout(1500);
+    await phone.getByRole('button', { name: /End Standup/ }).click();
+
+    // The display shows the summary, and the final turn was persisted.
+    await expect(display.getByText('Standup Complete')).toBeVisible({ timeout: 5000 });
+    const rows = sessionsFor(teamId, 'Zoe');
+    expect(rows).toHaveLength(1);
+    expect(rows[0].duration).toBeGreaterThan(1000);
+
+    await displayContext.close();
+    await phoneContext.close();
+  });
+});
+
+test.describe('Settings Layout', () => {
+  test('a long past sprint goal does not make the dialog scroll horizontally', async ({ page }) => {
+    const teamId = createTeamInDb('Long Goal Team', ['Alice']);
+    const db = new Database(TEST_DB_PATH);
+    db.prepare('UPDATE teams SET sprint_start = ?, sprint_length_days = 14 WHERE id = ?').run('2026-01-02', teamId);
+    db.prepare(
+      'INSERT INTO sprint_goals (team_id, start_date, goal, length_days, set_at, done_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(teamId, '2026-01-02', '- Prepare PRs for known bugs (in sprint) - Push bug fixes through review and get them all merged before the release', 14, 0, 1);
+    db.close();
+
+    await page.goto(`/${teamId}`);
+    await page.getByRole('button', { name: 'Open settings' }).click();
+    const dialog = page.locator('[data-slot="dialog-content"]');
+    await expect(dialog.getByText('Past goals')).toBeVisible({ timeout: 10000 });
+
+    const { scrollWidth, clientWidth } = await dialog.evaluate(el => ({ scrollWidth: el.scrollWidth, clientWidth: el.clientWidth }));
+    expect(scrollWidth).toBeLessThanOrEqual(clientWidth);
+  });
+});

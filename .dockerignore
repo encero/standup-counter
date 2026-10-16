@@ -1,0 +1,16 @@
+# Keep local state, secrets and host-built artifacts out of the build context
+.git
+.jj
+node_modules
+dist
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+backups
+playwright-report
+test-results
+.env
+.env.*
+*.local
+.DS_Store

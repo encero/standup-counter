@@ -30,8 +30,10 @@ WORKDIR /app
 ARG APP_VERSION=dev
 ENV APP_VERSION=$APP_VERSION
 
-# Install build dependencies for native modules (better-sqlite3)
-RUN apk add --no-cache python3 make g++ sqlite
+# Install build dependencies for native modules (better-sqlite3).
+# tzdata lets TZ (e.g. Europe/Prague) set the local day used for standup dates
+# and sprint rollover; su-exec drops root in the entrypoint.
+RUN apk add --no-cache python3 make g++ sqlite tzdata su-exec
 
 # Copy package files for production deps only
 COPY package*.json ./
@@ -52,11 +54,13 @@ COPY tsconfig.json ./
 # Copy scripts for CLI tools (team management, seeding, etc.)
 COPY scripts ./scripts
 
-# Install tsx for running TypeScript server
-RUN npm install -g tsx
+# tsx (pinned in package.json dependencies) runs the TypeScript server. Link it
+# onto PATH so `docker exec <c> tsx scripts/team-cli.ts ...` keeps working.
+RUN ln -s /app/node_modules/.bin/tsx /usr/local/bin/tsx \
+    && chmod +x /app/scripts/docker-entrypoint.sh
 
-# Create data directory for SQLite
-RUN mkdir -p /data
+# Create data directory for SQLite, owned by the unprivileged runtime user
+RUN mkdir -p /data && chown node:node /data
 
 # Expose ports
 EXPOSE 3001
@@ -64,5 +68,6 @@ EXPOSE 3001
 # Set environment variable for database path
 ENV DB_PATH=/data/standup.db
 
-# Start server
-CMD ["tsx", "server/index.ts"]
+# Start server as the unprivileged `node` user (see scripts/docker-entrypoint.sh)
+ENTRYPOINT ["/app/scripts/docker-entrypoint.sh"]
+CMD ["node_modules/.bin/tsx", "server/index.ts"]

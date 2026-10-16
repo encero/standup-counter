@@ -66,7 +66,7 @@ export function StandupSummary({ open, onClose, sessions, teamMembers, teamId, s
   useEffect(() => {
     if (!open || !teamId || !standupId) return;
     let cancelled = false;
-    fetch(`${API_URL}/notes?standupId=${standupId}`)
+    fetch(`${API_URL}/notes?standupId=${encodeURIComponent(standupId)}`)
       .then(r => r.json())
       .then((data: SyncNote[]) => { if (!cancelled) setNotes(Array.isArray(data) ? data : []); })
       .catch(console.error);

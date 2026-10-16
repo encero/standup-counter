@@ -2,7 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createServer } from 'http';
+import { createServer, IncomingMessage } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import { parse as parseUrl } from 'url';
 import { networkInterfaces } from 'os';
@@ -17,6 +17,19 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT) : 3001;
 // and read here at runtime from the same env var. When a redeploy changes this,
 // connected clients detect the mismatch on reconnect and reload themselves.
 const APP_VERSION = process.env.APP_VERSION || 'dev';
+const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+
+// Cross-origin access. In production the SPA is served by this same server, so
+// no cross-origin access is needed at all; set CORS_ORIGINS (comma-separated)
+// only if another origin legitimately calls the API. In development the Vite
+// dev server runs on a different localhost port, so loopback origins are allowed.
+const LOOPBACK_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
+const CORS_ORIGINS = (process.env.CORS_ORIGINS || '').split(',').map(s => s.trim()).filter(Boolean);
+
+function isAllowedCrossOrigin(origin: string): boolean {
+  if (CORS_ORIGINS.includes('*') || CORS_ORIGINS.includes(origin)) return true;
+  return !IS_PRODUCTION && LOOPBACK_ORIGIN.test(origin);
+}
 
 // Get local network IP addresses
 function getLocalIPs(): string[] {
@@ -32,17 +45,107 @@ function getLocalIPs(): string[] {
   return ips;
 }
 
-app.use(cors());
-app.use(express.json());
+// Behind a reverse proxy (e.g. the k8s ingress) set TRUST_PROXY to the number of
+// proxy hops (usually 1) so rate limiting sees real client IPs, not the proxy's.
+if (process.env.TRUST_PROXY) {
+  const hops = Number(process.env.TRUST_PROXY);
+  app.set('trust proxy', Number.isInteger(hops) ? hops : process.env.TRUST_PROXY);
+}
+app.disable('x-powered-by');
+
+// Security headers. The team ID lives in the URL and acts as the access token, so
+// never leak it to other sites via Referer. Framing is limited to this origin by
+// default (clickjacking); set FRAME_ANCESTORS (CSP syntax, e.g. "*" or
+// "https://dash.example.com") if the wall display is embedded elsewhere.
+const FRAME_ANCESTORS = process.env.FRAME_ANCESTORS || "'self'";
+app.use((_req, res, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('Content-Security-Policy', [
+    "default-src 'self'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "font-src 'self' data:",
+    "connect-src 'self' ws: wss:",
+    "object-src 'none'",
+    "base-uri 'self'",
+    `frame-ancestors ${FRAME_ANCESTORS}`,
+  ].join('; '));
+  next();
+});
+
+app.use(cors({ origin: (origin, cb) => cb(null, !origin || isAllowedCrossOrigin(origin)) }));
+app.use(express.json({ limit: '256kb' }));
 
 // Serve static files in production
-if (process.env.NODE_ENV === 'production') {
+if (IS_PRODUCTION) {
   app.use(express.static(path.join(__dirname, '..', 'dist')));
+}
+
+// --- Team lookup rate limiting ----------------------------------------------
+// The team ID is the access token, so throttle clients that keep presenting
+// unknown IDs (enumeration). Only failed lookups count against the budget, but
+// once exhausted every lookup from that client is refused until the window ends,
+// so a hit can't be distinguished from a miss while blocked.
+const LOOKUP_FAIL_LIMIT = Number(process.env.TEAM_LOOKUP_FAIL_LIMIT) || 100;
+const LOOKUP_WINDOW_MS = 10 * 60 * 1000;
+const lookupFailures = new Map<string, { count: number; resetAt: number }>();
+
+function lookupBlocked(ip: string): boolean {
+  const entry = lookupFailures.get(ip);
+  if (!entry) return false;
+  if (Date.now() >= entry.resetAt) {
+    lookupFailures.delete(ip);
+    return false;
+  }
+  return entry.count >= LOOKUP_FAIL_LIMIT;
+}
+
+function recordLookupFailure(ip: string) {
+  const now = Date.now();
+  const entry = lookupFailures.get(ip);
+  if (!entry || now >= entry.resetAt) {
+    lookupFailures.set(ip, { count: 1, resetAt: now + LOOKUP_WINDOW_MS });
+  } else {
+    entry.count++;
+  }
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of lookupFailures) {
+    if (now >= entry.resetAt) lookupFailures.delete(ip);
+  }
+}, LOOKUP_WINDOW_MS).unref();
+
+function teamExists(teamId: string): boolean {
+  return Boolean(db.prepare('SELECT 1 FROM teams WHERE id = ?').get(teamId));
 }
 
 // Create HTTP server and WebSocket server
 const server = createServer(app);
-const wss = new WebSocketServer({ server });
+
+// Same-origin browsers, non-browser clients (no Origin header), and explicitly
+// allowed origins may open a socket. Blocks cross-site WebSocket hijacking.
+function isAllowedWsOrigin(origin: string | undefined, host: string | undefined): boolean {
+  if (!origin) return true;
+  try {
+    if (host && new URL(origin).host === host) return true;
+  } catch {
+    return false;
+  }
+  return isAllowedCrossOrigin(origin);
+}
+
+const wss = new WebSocketServer({
+  server,
+  // Client messages are tiny control frames; the default 100 MB cap invites
+  // memory exhaustion (and every message is re-broadcast to the whole team).
+  maxPayload: 16 * 1024,
+  verifyClient: ({ origin, req }: { origin: string; req: IncomingMessage }) =>
+    isAllowedWsOrigin(origin, req.headers.host),
+});
 
 // Post-standup "sync" / parking-lot note
 interface SyncNote {
@@ -120,6 +223,104 @@ setInterval(() => {
   }
 }, 100);
 
+// Client IP for a raw upgrade request, honouring TRUST_PROXY like Express does
+// for HTTP requests (req.ip): walk back that many hops through X-Forwarded-For.
+function wsClientIp(req: IncomingMessage): string {
+  const remote = req.socket.remoteAddress || '';
+  const hops = Number(process.env.TRUST_PROXY);
+  if (!Number.isInteger(hops) || hops <= 0) return remote;
+  const forwarded = String(req.headers['x-forwarded-for'] || '')
+    .split(',').map(s => s.trim()).filter(Boolean);
+  const chain = [remote, ...forwarded.reverse()];
+  return chain[Math.min(hops, chain.length - 1)];
+}
+
+const MAX_NAME_LENGTH = 100;
+
+// Keep only the known speaker fields, bounded. The speaker object is stored in
+// memory and re-broadcast to every client in the team, so never trust its shape.
+// The name is taken from the members table when the member exists there.
+function sanitizeSpeaker(teamId: string, raw: unknown): TimerState['currentSpeaker'] {
+  if (!raw || typeof raw !== 'object') return null;
+  const r = raw as { id?: unknown; name?: unknown; isGuest?: unknown };
+  if (typeof r.id !== 'string' || !r.id || r.id.length > MAX_NAME_LENGTH) return null;
+  const member = db.prepare('SELECT name, is_guest FROM team_members WHERE id = ? AND team_id = ?')
+    .get(r.id, teamId) as { name: string; is_guest: number } | undefined;
+  const name = member?.name ?? (typeof r.name === 'string' ? r.name.slice(0, MAX_NAME_LENGTH) : '');
+  if (!name) return null;
+  const isGuest = member ? Boolean(member.is_guest) : r.isGuest === true;
+  return isGuest ? { id: r.id, name, isGuest } : { id: r.id, name };
+}
+
+interface SessionRow {
+  id: string;
+  memberId: string;
+  memberName: string;
+  standupId: string;
+  startTime: number;
+  endTime: number | null;
+  duration: number;
+  interruptions: number;
+  pausedDuration: number;
+}
+
+const SESSION_COLUMNS = `id, member_id as memberId, member_name as memberName,
+  standup_id as standupId, start_time as startTime, end_time as endTime,
+  duration, interruptions, paused_duration as pausedDuration`;
+
+// Record the current speaker's turn. Sessions are written HERE, once, rather than
+// by browser clients: with several timer pages open each one used to save its
+// own copy of every turn, and a standup ended from the control page saved
+// nothing for the last speaker. A speaker who talks twice in one standup has
+// both turns accumulated into a single session row, as before.
+function recordCurrentTurn(teamId: string, state: TimerState, now = Date.now()): SessionRow | null {
+  const speaker = state.currentSpeaker;
+  if (state.status === 'idle' || !speaker || !state.startTime || !state.standupId) return null;
+
+  // Include a pause that is still in progress at the moment the turn ends.
+  const paused = state.totalPaused + (state.pauseStart ? now - state.pauseStart : 0);
+  const elapsed = now - state.startTime - paused;
+  if (elapsed <= 0) return null;
+
+  // sessions.member_id is a foreign key. A guest can start speaking before the
+  // client's POST /members lands, so make sure the member row exists.
+  db.prepare(
+    'INSERT INTO team_members (id, name, team_id, is_guest) VALUES (?, ?, ?, ?) ON CONFLICT(id) DO NOTHING'
+  ).run(speaker.id, speaker.name, teamId, speaker.isGuest ? 1 : 0);
+
+  const existing = db.prepare(
+    `SELECT id FROM sessions WHERE team_id = ? AND standup_id = ? AND member_id = ?`
+  ).get(teamId, state.standupId, speaker.id) as { id: string } | undefined;
+
+  let id: string;
+  if (existing) {
+    id = existing.id;
+    db.prepare(`
+      UPDATE sessions SET end_time = ?, duration = duration + ?,
+        interruptions = interruptions + ?, paused_duration = paused_duration + ?
+      WHERE id = ?
+    `).run(now, elapsed, state.interruptions, paused, id);
+  } else {
+    id = crypto.randomUUID();
+    db.prepare(`
+      INSERT INTO sessions (id, team_id, member_id, member_name, standup_id, start_time, end_time, duration, interruptions, paused_duration)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, teamId, speaker.id, speaker.name, state.standupId, state.startTime, now, elapsed, state.interruptions, paused);
+  }
+
+  updateStandupAggregate(state.standupId, teamId);
+  return db.prepare(`SELECT ${SESSION_COLUMNS} FROM sessions WHERE id = ?`).get(id) as SessionRow;
+}
+
+function recordAndBroadcastTurn(teamId: string, state: TimerState) {
+  try {
+    const session = recordCurrentTurn(teamId, state);
+    if (session) broadcastToTeam(teamId, { type: 'session', session });
+  } catch (err) {
+    console.error('Failed to record session:', err);
+  }
+}
+
 // WebSocket connection handler
 wss.on('connection', (ws, req) => {
   // Extract team ID from URL path: /ws/<teamId>
@@ -133,11 +334,17 @@ wss.on('connection', (ws, req) => {
   }
 
   const teamId = match[1];
+  const ip = wsClientIp(req);
+
+  if (lookupBlocked(ip)) {
+    ws.close(4029, 'Too many requests');
+    return;
+  }
 
   // Verify team exists
-  const team = db.prepare('SELECT id FROM teams WHERE id = ?').get(teamId);
-  if (!team) {
-    console.log(`WebSocket rejected: team not found: ${teamId}`);
+  if (!teamExists(teamId)) {
+    recordLookupFailure(ip);
+    console.log('WebSocket rejected: team not found');
     ws.close(4001, 'Team not found');
     return;
   }
@@ -156,15 +363,20 @@ wss.on('connection', (ws, req) => {
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString());
+      if (!msg || typeof msg !== 'object') return;
       const timerState = getTeamState(teamId);
 
       switch (msg.type) {
-        case 'start':
+        case 'start': {
+          const speaker = sanitizeSpeaker(teamId, msg.speaker);
+          if (!speaker) break;
+          // Close out the previous speaker's turn before switching.
+          recordAndBroadcastTurn(teamId, timerState);
           // Reuse a standupId already created by an early sync note; otherwise mint one.
           if (!timerState.standupId) {
             timerState.standupId = crypto.randomUUID();
           }
-          timerState.currentSpeaker = msg.speaker;
+          timerState.currentSpeaker = speaker;
           timerState.status = 'running';
           timerState.startTime = Date.now();
           timerState.elapsedTime = 0;
@@ -178,6 +390,7 @@ wss.on('connection', (ws, req) => {
           // rolls the banner over to the current window for everyone.
           broadcastToTeam(teamId, { type: 'sprint', sprint: computeSprintStatus(teamId) });
           break;
+        }
 
         case 'pause':
           if (timerState.status === 'running') {
@@ -198,7 +411,9 @@ wss.on('connection', (ws, req) => {
           break;
 
         case 'stop':
-          // Broadcast end_standup with the standupId + any sync notes before resetting
+          // Save the final speaker's turn, then broadcast end_standup with the
+          // standupId + any sync notes before resetting.
+          recordAndBroadcastTurn(teamId, timerState);
           if (timerState.standupId) {
             broadcastToTeam(teamId, {
               type: 'end_standup',
@@ -206,15 +421,7 @@ wss.on('connection', (ws, req) => {
               syncNotes: timerState.syncNotes,
             });
           }
-          timerState.currentSpeaker = null;
-          timerState.standupId = null;
-          timerState.status = 'idle';
-          timerState.elapsedTime = 0;
-          timerState.interruptions = 0;
-          timerState.startTime = null;
-          timerState.totalPaused = 0;
-          timerState.pauseStart = null;
-          timerState.syncNotes = [];
+          Object.assign(timerState, defaultTimerState());
           broadcastToTeam(teamId, { type: 'state', ...timerState });
           break;
 
@@ -270,6 +477,13 @@ wss.on('connection', (ws, req) => {
     }
   });
 
+  // Without a listener, a socket error (e.g. a frame over maxPayload) would be
+  // an unhandled 'error' event and crash the whole server. ws closes the socket
+  // itself afterwards; 'close' below does the cleanup.
+  ws.on('error', (err) => {
+    console.warn(`WebSocket error (team ${teamId}):`, err.message);
+  });
+
   ws.on('close', () => {
     console.log(`Client disconnected from team: ${teamId}`);
     getTeamClients(teamId).delete(ws);
@@ -282,10 +496,16 @@ interface TeamRequest extends Request {
 }
 
 function validateTeam(req: Request, res: Response, next: NextFunction) {
-  const teamId = req.params.teamId;
-  const team = db.prepare('SELECT id FROM teams WHERE id = ?').get(teamId);
+  const teamId = req.params.teamId as string;
+  const ip = req.ip || req.socket.remoteAddress || '';
 
-  if (!team) {
+  if (lookupBlocked(ip)) {
+    res.status(429).json({ error: 'Too many requests' });
+    return;
+  }
+
+  if (!teamExists(teamId)) {
+    recordLookupFailure(ip);
     res.status(404).json({ error: 'Team not found' });
     return;
   }
@@ -294,8 +514,20 @@ function validateTeam(req: Request, res: Response, next: NextFunction) {
   next();
 }
 
+// Local calendar date (server TZ) as YYYY-MM-DD, consistent with getDay().
+function localYMD(ms: number): string {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
 // Helper to update standups aggregate table
 function updateStandupAggregate(standupId: string, teamId: string) {
+  if (!standupId) return;
+
+  // Never let one team's sessions overwrite another team's standup row.
+  const owner = db.prepare('SELECT team_id FROM standups WHERE id = ?').get(standupId) as { team_id: string | null } | undefined;
+  if (owner && owner.team_id && owner.team_id !== teamId) return;
+
   const aggregate = db.prepare(`
     SELECT
       MIN(start_time) as startTime,
@@ -303,13 +535,12 @@ function updateStandupAggregate(standupId: string, teamId: string) {
       SUM(duration) as totalDuration,
       COUNT(DISTINCT member_id) as speakerCount,
       SUM(interruptions) as totalInterruptions
-    FROM sessions WHERE standup_id = ?
-  `).get(standupId) as { startTime: number; endTime: number; totalDuration: number; speakerCount: number; totalInterruptions: number };
+    FROM sessions WHERE standup_id = ? AND team_id = ?
+  `).get(standupId, teamId) as { startTime: number; endTime: number; totalDuration: number; speakerCount: number; totalInterruptions: number };
 
   if (aggregate && aggregate.startTime) {
-    const date = new Date(aggregate.startTime);
-    const dateStr = date.toISOString().split('T')[0];
-    const dayOfWeek = date.getDay();
+    const dateStr = localYMD(aggregate.startTime);
+    const dayOfWeek = new Date(aggregate.startTime).getDay();
 
     db.prepare(`
       INSERT OR REPLACE INTO standups (id, team_id, date, day_of_week, start_time, end_time, total_duration, speaker_count, total_interruptions)
@@ -432,15 +663,39 @@ app.get('/api/version', (_req, res) => {
   res.json({ version: APP_VERSION });
 });
 
-// Server info endpoint (no auth required)
+// Liveness/readiness probe target (no auth, no information disclosed)
+app.get('/healthz', (_req, res) => {
+  res.json({ ok: true });
+});
+
+// Server info endpoint (no auth required). Network URLs are a dev convenience for
+// opening the control page from a phone; in production they would only disclose
+// internal (pod) addresses, so they're omitted.
 app.get('/api/server-info', (_req, res) => {
-  const ips = getLocalIPs();
+  const ips = IS_PRODUCTION ? [] : getLocalIPs();
   res.json({
     port: PORT,
     localUrl: `http://localhost:${PORT}`,
     networkUrls: ips.map(ip => `http://${ip}:${PORT}`),
   });
 });
+
+// --- Request body validation helpers ----------------------------------------
+const MAX_ID_LENGTH = 100;
+
+function isId(v: unknown): v is string {
+  return typeof v === 'string' && v.length > 0 && v.length <= MAX_ID_LENGTH;
+}
+function isNonNegative(v: unknown): v is number {
+  return typeof v === 'number' && Number.isFinite(v) && v >= 0;
+}
+// Optional non-negative number: absent/null is fine, anything else must be valid.
+function isOptionalNonNegative(v: unknown): boolean {
+  return v === undefined || v === null || isNonNegative(v);
+}
+function badRequest(res: Response, error: string) {
+  res.status(400).json({ error });
+}
 
 // All API routes require team_id prefix
 const teamRouter = express.Router({ mergeParams: true });
@@ -456,9 +711,24 @@ teamRouter.get('/members', (req, res) => {
 
 teamRouter.post('/members', (req, res) => {
   const { teamId } = req.params;
-  const { id, name, isGuest } = req.body;
-  db.prepare('INSERT INTO team_members (id, name, team_id, is_guest) VALUES (?, ?, ?, ?)').run(id, name, teamId, isGuest ? 1 : 0);
-  res.json({ id, name, isGuest });
+  const { id: rawId, name: rawName, isGuest } = req.body ?? {};
+  const id = rawId === undefined ? crypto.randomUUID() : rawId;
+  const name = typeof rawName === 'string' ? rawName.trim() : '';
+  if (!isId(id)) return badRequest(res, 'Invalid member id');
+  if (!name || name.length > MAX_NAME_LENGTH) return badRequest(res, 'Name must be 1-100 characters');
+
+  const existing = db.prepare('SELECT team_id FROM team_members WHERE id = ?').get(id) as { team_id: string | null } | undefined;
+  if (existing && existing.team_id !== teamId) {
+    res.status(409).json({ error: 'Member id already exists' });
+    return;
+  }
+  // Idempotent within the team: the server may already have created this member
+  // when they started speaking (see recordCurrentTurn).
+  db.prepare(`
+    INSERT INTO team_members (id, name, team_id, is_guest) VALUES (?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET name = excluded.name, is_guest = excluded.is_guest
+  `).run(id, name, teamId, isGuest ? 1 : 0);
+  res.json({ id, name, isGuest: Boolean(isGuest) });
 });
 
 teamRouter.delete('/members/:id', (req, res) => {
@@ -471,21 +741,37 @@ teamRouter.delete('/members/:id', (req, res) => {
 teamRouter.get('/sessions', (req, res) => {
   const { teamId } = req.params;
   const sessions = db.prepare(`
-    SELECT id, member_id as memberId, member_name as memberName,
-           standup_id as standupId, start_time as startTime, end_time as endTime,
-           duration, interruptions, paused_duration as pausedDuration
+    SELECT ${SESSION_COLUMNS}
     FROM sessions WHERE team_id = ? ORDER BY created_at DESC
   `).all(teamId);
   res.json(sessions);
 });
 
+// Sessions are recorded server-side from the timer (see recordCurrentTurn).
+// These write endpoints remain for API compatibility (scripts, older clients).
 teamRouter.post('/sessions', (req, res) => {
   const { teamId } = req.params;
-  const { id, memberId, memberName, standupId, startTime, endTime, duration, interruptions, pausedDuration } = req.body;
-  db.prepare(`
-    INSERT INTO sessions (id, team_id, member_id, member_name, standup_id, start_time, end_time, duration, interruptions, paused_duration)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, teamId, memberId, memberName, standupId, startTime, endTime, duration, interruptions, pausedDuration);
+  const { id, memberId, memberName, standupId, startTime, endTime, duration, interruptions, pausedDuration } = req.body ?? {};
+  if (!isId(id) || !isId(memberId)) return badRequest(res, 'Invalid id or memberId');
+  if (typeof memberName !== 'string' || !memberName || memberName.length > MAX_NAME_LENGTH) return badRequest(res, 'Invalid memberName');
+  if (typeof standupId !== 'string' || standupId.length > MAX_ID_LENGTH) return badRequest(res, 'Invalid standupId');
+  if (!isNonNegative(startTime) || !isNonNegative(duration)) return badRequest(res, 'Invalid startTime or duration');
+  if (!isOptionalNonNegative(endTime) || !isOptionalNonNegative(interruptions) || !isOptionalNonNegative(pausedDuration)) {
+    return badRequest(res, 'Invalid endTime, interruptions or pausedDuration');
+  }
+
+  try {
+    db.prepare(`
+      INSERT INTO sessions (id, team_id, member_id, member_name, standup_id, start_time, end_time, duration, interruptions, paused_duration)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(id, teamId, memberId, memberName, standupId, startTime, endTime ?? null, duration, interruptions ?? 0, pausedDuration ?? 0);
+  } catch (err) {
+    if ((err as { code?: string }).code === 'SQLITE_CONSTRAINT_PRIMARYKEY') {
+      res.status(409).json({ error: 'Session id already exists' });
+      return;
+    }
+    throw err;
+  }
 
   // Update standup aggregate
   updateStandupAggregate(standupId, teamId);
@@ -496,15 +782,23 @@ teamRouter.post('/sessions', (req, res) => {
 teamRouter.put('/sessions/:id', (req, res) => {
   const { teamId } = req.params;
   const { id } = req.params;
-  const { standupId, endTime, duration, interruptions, pausedDuration } = req.body;
+  const { endTime, duration, interruptions, pausedDuration } = req.body ?? {};
+  if (![endTime, duration, interruptions, pausedDuration].every(isOptionalNonNegative)) {
+    return badRequest(res, 'Numeric fields must be non-negative numbers');
+  }
+  // Omitted fields keep their current value.
   db.prepare(`
-    UPDATE sessions SET end_time = ?, duration = ?, interruptions = ?, paused_duration = ?
+    UPDATE sessions SET end_time = COALESCE(?, end_time), duration = COALESCE(?, duration),
+      interruptions = COALESCE(?, interruptions), paused_duration = COALESCE(?, paused_duration)
     WHERE id = ? AND team_id = ?
-  `).run(endTime, duration, interruptions, pausedDuration, id, teamId);
+  `).run(endTime ?? null, duration ?? null, interruptions ?? null, pausedDuration ?? null, id, teamId);
 
-  // Update standup aggregate
-  if (standupId) {
-    updateStandupAggregate(standupId, teamId);
+  // Update the aggregate of the standup the session actually belongs to (the
+  // body's standupId is not trusted).
+  const row = db.prepare('SELECT standup_id FROM sessions WHERE id = ? AND team_id = ?')
+    .get(id, teamId) as { standup_id: string } | undefined;
+  if (row) {
+    updateStandupAggregate(row.standup_id, teamId);
   }
 
   res.json({ success: true });
@@ -512,8 +806,16 @@ teamRouter.put('/sessions/:id', (req, res) => {
 
 teamRouter.delete('/sessions', (req, res) => {
   const { teamId } = req.params;
-  db.prepare('DELETE FROM sessions WHERE team_id = ?').run(teamId);
-  db.prepare('DELETE FROM standups WHERE team_id = ?').run(teamId);
+  // Keep notes of a standup that is still in progress; everything else goes with
+  // the history it belonged to.
+  const activeStandupId = teamTimerStates.get(teamId)?.standupId ?? '';
+  db.transaction(() => {
+    db.prepare('DELETE FROM sessions WHERE team_id = ?').run(teamId);
+    db.prepare('DELETE FROM standups WHERE team_id = ?').run(teamId);
+    db.prepare('DELETE FROM sync_notes WHERE team_id = ? AND standup_id != ?').run(teamId, activeStandupId);
+  })();
+  // Let every open client drop its in-memory copy.
+  broadcastToTeam(teamId, { type: 'sessions_cleared' });
   res.json({ success: true });
 });
 
@@ -533,9 +835,15 @@ teamRouter.get('/notes', (req, res) => {
 });
 
 // Trends endpoints
+// Look-back window in days, clamped to something sane (default 30).
+function parseDays(raw: unknown): number {
+  const n = parseInt(String(raw));
+  return Number.isFinite(n) ? Math.min(3650, Math.max(1, n)) : 30;
+}
+
 teamRouter.get('/trends/standups', (req, res) => {
   const { teamId } = req.params;
-  const days = parseInt(req.query.days as string) || 30;
+  const days = parseDays(req.query.days);
   const since = Date.now() - days * 24 * 60 * 60 * 1000;
 
   const standups = db.prepare(`
@@ -552,7 +860,7 @@ teamRouter.get('/trends/standups', (req, res) => {
 
 teamRouter.get('/trends/team', (req, res) => {
   const { teamId } = req.params;
-  const days = parseInt(req.query.days as string) || 30;
+  const days = parseDays(req.query.days);
   const since = Date.now() - days * 24 * 60 * 60 * 1000;
 
   // Overall stats
@@ -601,7 +909,7 @@ teamRouter.get('/trends/team', (req, res) => {
 
 teamRouter.get('/trends/members', (req, res) => {
   const { teamId } = req.params;
-  const days = parseInt(req.query.days as string) || 30;
+  const days = parseDays(req.query.days);
   const now = Date.now();
   const since = now - days * 24 * 60 * 60 * 1000;
   const since7d = now - 7 * 24 * 60 * 60 * 1000;
@@ -625,12 +933,31 @@ teamRouter.get('/trends/members', (req, res) => {
   const sparklineData: Record<string, number[]> = {};
   const trends: Record<string, number> = {};
 
-  for (const member of allMembers) {
-    // 7-day average (daily totals, then average)
-    const sessions7d = db.prepare(`
+  // Prepared once, executed per member.
+  const sessionsSinceStmt = db.prepare(`
       SELECT start_time, duration FROM sessions
       WHERE member_id = ? AND team_id = ? AND start_time > ?
-    `).all(member.id, teamId, since7d) as Array<{ start_time: number; duration: number }>;
+    `);
+  const sparklineStmt = db.prepare(`
+      SELECT duration FROM sessions
+      WHERE member_id = ? AND team_id = ? AND start_time > ?
+      ORDER BY start_time DESC
+      LIMIT 10
+    `);
+  const recentStmt = db.prepare(`
+      SELECT AVG(duration) as avg FROM (
+        SELECT duration FROM sessions WHERE member_id = ? AND team_id = ? ORDER BY start_time DESC LIMIT 3
+      )
+    `);
+  const previousStmt = db.prepare(`
+      SELECT AVG(duration) as avg FROM (
+        SELECT duration FROM sessions WHERE member_id = ? AND team_id = ? ORDER BY start_time DESC LIMIT 3 OFFSET 3
+      )
+    `);
+
+  for (const member of allMembers) {
+    // 7-day average (daily totals, then average)
+    const sessions7d = sessionsSinceStmt.all(member.id, teamId, since7d) as Array<{ start_time: number; duration: number }>;
 
     const daily7d: Record<string, number> = {};
     for (const s of sessions7d) {
@@ -644,10 +971,7 @@ teamRouter.get('/trends/members', (req, res) => {
     };
 
     // 30-day average (daily totals, then average)
-    const sessions30d = db.prepare(`
-      SELECT start_time, duration FROM sessions
-      WHERE member_id = ? AND team_id = ? AND start_time > ?
-    `).all(member.id, teamId, since) as Array<{ start_time: number; duration: number }>;
+    const sessions30d = sessionsSinceStmt.all(member.id, teamId, since) as Array<{ start_time: number; duration: number }>;
 
     const daily30d: Record<string, number> = {};
     for (const s of sessions30d) {
@@ -660,25 +984,12 @@ teamRouter.get('/trends/members', (req, res) => {
       : null;
 
     // Sparkline data (last 10 sessions)
-    const durations = db.prepare(`
-      SELECT duration FROM sessions
-      WHERE member_id = ? AND team_id = ? AND start_time > ?
-      ORDER BY start_time DESC
-      LIMIT 10
-    `).all(member.id, teamId, since) as Array<{ duration: number }>;
+    const durations = sparklineStmt.all(member.id, teamId, since) as Array<{ duration: number }>;
     sparklineData[member.id] = durations.map(d => d.duration).reverse();
 
     // Calculate trends (last 3 vs previous 3)
-    const recent = db.prepare(`
-      SELECT AVG(duration) as avg FROM (
-        SELECT duration FROM sessions WHERE member_id = ? AND team_id = ? ORDER BY start_time DESC LIMIT 3
-      )
-    `).get(member.id, teamId) as { avg: number };
-    const previous = db.prepare(`
-      SELECT AVG(duration) as avg FROM (
-        SELECT duration FROM sessions WHERE member_id = ? AND team_id = ? ORDER BY start_time DESC LIMIT 3 OFFSET 3
-      )
-    `).get(member.id, teamId) as { avg: number };
+    const recent = recentStmt.get(member.id, teamId) as { avg: number };
+    const previous = previousStmt.get(member.id, teamId) as { avg: number };
 
     trends[member.id] = recent?.avg && previous?.avg
       ? ((recent.avg - previous.avg) / previous.avg) * 100
@@ -703,16 +1014,34 @@ teamRouter.get('/settings', (req, res) => {
 
 teamRouter.put('/settings', (req, res) => {
   const { teamId } = req.params;
-  const { stockSymbols, expectedSeconds } = req.body;
+  const { stockSymbols, expectedSeconds } = req.body ?? {};
+
+  if (stockSymbols !== undefined && stockSymbols !== null && typeof stockSymbols !== 'string') {
+    return badRequest(res, 'stockSymbols must be a comma-separated string');
+  }
+  if (expectedSeconds !== undefined &&
+      !(Number.isInteger(expectedSeconds) && expectedSeconds >= 1 && expectedSeconds <= 3600)) {
+    return badRequest(res, 'expectedSeconds must be an integer between 1 and 3600');
+  }
 
   if (stockSymbols !== undefined) {
-    db.prepare('UPDATE teams SET stock_symbols = ? WHERE id = ?').run(stockSymbols || '', teamId);
+    db.prepare('UPDATE teams SET stock_symbols = ? WHERE id = ?').run(normalizeStockSymbols(stockSymbols || ''), teamId);
   }
   if (expectedSeconds !== undefined) {
     db.prepare('UPDATE teams SET expected_seconds = ? WHERE id = ?').run(expectedSeconds, teamId);
   }
   res.json({ success: true });
 });
+
+// Strict YYYY-MM-DD that names a real date (rejects e.g. 2025-13-45, which
+// Date.UTC would silently roll over into a different date).
+function isValidYMD(v: unknown): v is string {
+  if (typeof v !== 'string') return false;
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(v);
+  if (!m) return false;
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  return d.toISOString().slice(0, 10) === v;
+}
 
 // Sprint goal endpoints
 teamRouter.get('/sprint', (req, res) => {
@@ -734,9 +1063,14 @@ teamRouter.put('/sprint', (req, res) => {
 
   // Apply cadence changes FIRST so any goal/done in the same request binds to the
   // (possibly new) current window resolved below.
+  if (startDate !== undefined && startDate !== '' && !isValidYMD(startDate)) {
+    return badRequest(res, 'startDate must be a real calendar date (YYYY-MM-DD) or empty');
+  }
+
+  const before = computeSprintStatus(teamId);
+
   if (startDate !== undefined) {
-    const v = typeof startDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(startDate) ? startDate : '';
-    db.prepare('UPDATE teams SET sprint_start = ? WHERE id = ?').run(v, teamId);
+    db.prepare('UPDATE teams SET sprint_start = ? WHERE id = ?').run(startDate || '', teamId);
   }
   if (lengthDays !== undefined) {
     const n = Math.min(60, Math.max(1, Math.round(Number(lengthDays) || 14)));
@@ -745,6 +1079,22 @@ teamRouter.put('/sprint', (req, res) => {
 
   // Resolve the current window from the now-current cadence.
   const current = computeSprintStatus(teamId);
+
+  // Re-anchoring the cadence moves today's window start, which is the goal's key.
+  // Carry the goal that was current a moment ago over to the re-keyed window so
+  // editing the cadence doesn't silently drop it (unless that window already
+  // has a goal of its own).
+  if (before.configured && before.hasGoal && current.configured && before.windowStart !== current.windowStart) {
+    db.prepare(`
+      UPDATE sprint_goals SET start_date = ?, length_days = ?
+      WHERE team_id = ? AND start_date = ?
+        AND NOT EXISTS (SELECT 1 FROM sprint_goals WHERE team_id = ? AND start_date = ?)
+    `).run(current.windowStart, current.lengthDays, teamId, before.windowStart, teamId, current.windowStart);
+  }
+
+  if (goal !== undefined && String(goal).trim() && !current.configured) {
+    return badRequest(res, 'Set a sprint start date before setting a goal');
+  }
 
   if (goal !== undefined && current.configured) {
     const text = String(goal).slice(0, 200);
@@ -814,10 +1164,29 @@ function getPrStatus(teamId: string): { prs: PrInfo[]; syncedAt: number | null }
   }
 }
 
+function presentedBearer(req: Request): string {
+  const auth = req.header('authorization') || '';
+  return auth.startsWith('Bearer ') ? auth.slice(7) : '';
+}
+
 // Rotate (or first-time generate) the team's ingest token. Returns the raw
 // token ONCE — only its hash is stored, so it can't be retrieved later.
+// The first token can be generated by anyone with the team URL (that's the
+// setup flow), but once one exists, rotating it requires presenting the current
+// token. Otherwise anyone with the URL could revoke the real publisher and push
+// a forged queue. A lost token is reset on the server: `npm run team pr-token`.
 teamRouter.post('/pr-status/token', (req, res) => {
   const { teamId } = req.params;
+  const row = db.prepare('SELECT pr_ingest_token_hash FROM teams WHERE id = ?')
+    .get(teamId) as { pr_ingest_token_hash: string | null } | undefined;
+  const existing = row?.pr_ingest_token_hash;
+  if (existing) {
+    const presented = presentedBearer(req);
+    if (!presented || !tokensMatch(presented, existing)) {
+      res.status(401).json({ error: 'A token already exists. Present it as a Bearer token to rotate, or reset it on the server with: npm run team pr-token <teamId>' });
+      return;
+    }
+  }
   const token = randomBytes(24).toString('hex');
   db.prepare('UPDATE teams SET pr_ingest_token_hash = ? WHERE id = ?').run(hashToken(token), teamId);
   res.json({ token });
@@ -836,12 +1205,11 @@ teamRouter.post('/pr-status', (req, res) => {
   const expected = row?.pr_ingest_token_hash;
 
   if (!expected) {
-    res.status(403).json({ error: 'No ingest token configured. Run: npm run team pr-token ' + teamId });
+    res.status(403).json({ error: 'No ingest token configured. Run: npm run team pr-token <teamId>' });
     return;
   }
 
-  const auth = req.header('authorization') || '';
-  const presented = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+  const presented = presentedBearer(req);
   if (!presented || !tokensMatch(presented, expected)) {
     res.status(401).json({ error: 'Invalid ingest token' });
     return;
@@ -870,12 +1238,106 @@ teamRouter.post('/pr-status', (req, res) => {
   res.json({ ok: true, count: prs.length, syncedAt: updatedAt });
 });
 
+// --- Stock quotes -------------------------------------------------------------
+// Symbols are user-configured and end up in an outbound request URL, so they're
+// validated, capped, and fetched with a timeout. Quotes are cached briefly so N
+// clients polling every minute don't turn into N×symbols upstream requests.
+const STOCK_SYMBOL = /^[A-Z0-9][A-Z0-9.^=-]{0,14}$/;
+const MAX_STOCK_SYMBOLS = 10;
+const STOCK_CACHE_MS = 60_000;
+const STOCK_FETCH_TIMEOUT_MS = 5_000;
+
+interface StockQuote {
+  symbol: string;
+  name: string;
+  price: number;
+  change: number;
+  changePercent: number;
+  history: number[];
+}
+
+const stockCache = new Map<string, { at: number; quote: StockQuote | null }>();
+
+function parseStockSymbols(raw: string): string[] {
+  const symbols = raw.split(',').map(s => s.trim().toUpperCase()).filter(s => STOCK_SYMBOL.test(s));
+  return [...new Set(symbols)].slice(0, MAX_STOCK_SYMBOLS);
+}
+
+function normalizeStockSymbols(raw: string): string {
+  return parseStockSymbols(raw).join(',');
+}
+
+async function fetchStockQuote(symbol: string): Promise<StockQuote | null> {
+  const cached = stockCache.get(symbol);
+  if (cached && Date.now() - cached.at < STOCK_CACHE_MS) return cached.quote;
+
+  let quote: StockQuote | null = null;
+  try {
+    // Yahoo Finance v8 chart API with 30-day history
+    const response = await fetch(
+      `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=1mo`,
+      {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)' },
+        signal: AbortSignal.timeout(STOCK_FETCH_TIMEOUT_MS),
+      }
+    );
+
+    if (response.ok) {
+      const data = await response.json() as {
+        chart?: {
+          result?: Array<{
+            meta: {
+              symbol: string;
+              shortName: string;
+              regularMarketPrice: number;
+              previousClose: number;
+            };
+            indicators?: {
+              quote?: Array<{
+                close?: (number | null)[];
+              }>;
+            };
+          }>;
+        };
+      };
+
+      const result = data.chart?.result?.[0];
+      if (result) {
+        const meta = result.meta;
+        const closePrices = result.indicators?.quote?.[0]?.close?.filter((p): p is number => p !== null) || [];
+        const change = meta.regularMarketPrice - meta.previousClose;
+        quote = {
+          symbol: meta.symbol,
+          name: meta.shortName || meta.symbol,
+          price: meta.regularMarketPrice,
+          change,
+          changePercent: (change / meta.previousClose) * 100,
+          history: closePrices,
+        };
+      }
+    }
+  } catch {
+    quote = null;
+  }
+
+  stockCache.set(symbol, { at: Date.now(), quote });
+  return quote;
+}
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [symbol, entry] of stockCache) {
+    if (now - entry.at >= STOCK_CACHE_MS) stockCache.delete(symbol);
+  }
+}, 10 * STOCK_CACHE_MS).unref();
+
 // Stock quotes endpoint - with 30-day history for charts
 teamRouter.get('/stocks', async (req, res) => {
   const { teamId } = req.params;
   const team = db.prepare('SELECT stock_symbols FROM teams WHERE id = ?').get(teamId) as { stock_symbols: string } | undefined;
 
-  const symbols = (team?.stock_symbols || '').split(',').map(s => s.trim().toUpperCase()).filter(Boolean);
+  // Re-validated on read too, so values stored before validation existed are safe.
+  const symbols = parseStockSymbols(team?.stock_symbols || '');
 
   if (symbols.length === 0) {
     res.json({ quotes: [] });
@@ -883,56 +1345,7 @@ teamRouter.get('/stocks', async (req, res) => {
   }
 
   try {
-    // Yahoo Finance v8 chart API with 30-day history
-    const quotes = await Promise.all(symbols.map(async (symbol) => {
-      try {
-        const response = await fetch(
-          `https://query1.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1mo`,
-          { headers: { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)' } }
-        );
-
-        if (!response.ok) return null;
-
-        const data = await response.json() as {
-          chart: {
-            result: Array<{
-              meta: {
-                symbol: string;
-                shortName: string;
-                regularMarketPrice: number;
-                previousClose: number;
-              };
-              indicators: {
-                quote: Array<{
-                  close: (number | null)[];
-                }>;
-              };
-            }>;
-          };
-        };
-
-        const result = data.chart?.result?.[0];
-        if (!result) return null;
-
-        const meta = result.meta;
-        const closePrices = result.indicators?.quote?.[0]?.close?.filter((p): p is number => p !== null) || [];
-
-        const change = meta.regularMarketPrice - meta.previousClose;
-        const changePercent = (change / meta.previousClose) * 100;
-
-        return {
-          symbol: meta.symbol,
-          name: meta.shortName || meta.symbol,
-          price: meta.regularMarketPrice,
-          change,
-          changePercent,
-          history: closePrices,
-        };
-      } catch {
-        return null;
-      }
-    }));
-
+    const quotes = await Promise.all(symbols.map(fetchStockQuote));
     res.json({ quotes: quotes.filter(Boolean) });
   } catch (err) {
     console.error('Stock fetch error:', err);
@@ -944,7 +1357,7 @@ teamRouter.get('/stocks', async (req, res) => {
 app.use('/api/:teamId', validateTeam, teamRouter);
 
 // SPA fallback - serve index.html for all non-API routes in production
-if (process.env.NODE_ENV === 'production') {
+if (IS_PRODUCTION) {
   app.get('/{*path}', (_req, res) => {
     res.sendFile(path.join(__dirname, '..', 'dist', 'index.html'));
   });

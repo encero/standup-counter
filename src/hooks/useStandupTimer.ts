@@ -1,4 +1,4 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
+import { useState, useCallback, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ConnectionManager, type ConnectionStatus } from '@/lib/ConnectionManager';
 import type { TeamMember, SpeakerSession, SyncNote, TimerStatus, SprintStatus, PrInfo } from '@/types/standup';
@@ -65,74 +65,10 @@ export function useStandupTimer(teamId: string) {
       .catch(err => console.error('Failed to load PR status:', err));
   }, [teamId, API_URL]);
 
-  const startTimeRef = useRef<number | null>(null);
-  const pauseStartRef = useRef<number | null>(null);
-  const totalPausedRef = useRef(0);
-  const standupIdRef = useRef<string | null>(null);
-  // Track if we initiated a speaker change locally to avoid double-saving
-  const localSpeakerChangeRef = useRef(false);
-
-  // Refs for values needed in WebSocket handler to avoid stale closures
-  const currentSpeakerRef = useRef<TeamMember | null>(null);
-  const elapsedTimeRef = useRef(0);
-  const interruptionsRef = useRef(0);
-  const sessionsRef = useRef<SpeakerSession[]>([]);
-
-  // Keep refs in sync with state
-  useEffect(() => { currentSpeakerRef.current = currentSpeaker; }, [currentSpeaker]);
-  useEffect(() => { elapsedTimeRef.current = elapsedTime; }, [elapsedTime]);
-  useEffect(() => { interruptionsRef.current = interruptions; }, [interruptions]);
-  useEffect(() => { sessionsRef.current = sessions; }, [sessions]);
-
-  // Unified helper to save session for a speaker
-  const saveSession = useCallback((
-    speaker: TeamMember,
-    elapsed: number,
-    interruptionCount: number,
-    totalPaused: number,
-    standupId: string,
-    startTime: number
-  ) => {
-    if (elapsed <= 0) return;
-
-    const now = Date.now();
-    // Use ref-based lookup to avoid stale closure issues in WebSocket handler
-    const existingSession = sessionsRef.current.find(
-      s => s.memberId === speaker.id && s.standupId === standupId
-    );
-
-    if (existingSession) {
-      // Update existing session - accumulate time and interruptions
-      const updatedSession: SpeakerSession = {
-        ...existingSession,
-        endTime: now,
-        duration: existingSession.duration + elapsed,
-        interruptions: existingSession.interruptions + interruptionCount,
-        pausedDuration: existingSession.pausedDuration + totalPaused,
-      };
-      setSessions(prev => prev.map(s => s.id === existingSession.id ? updatedSession : s));
-      ConnectionManager.put(`${API_URL}/sessions/${existingSession.id}`, updatedSession)
-        .catch(err => console.error('Failed to update session:', err));
-    } else {
-      // Create new session
-      const session: SpeakerSession = {
-        id: crypto.randomUUID(),
-        memberId: speaker.id,
-        memberName: speaker.name,
-        standupId,
-        startTime,
-        endTime: now,
-        duration: elapsed,
-        interruptions: interruptionCount,
-        pausedDuration: totalPaused,
-      };
-      setSessions(prev => [...prev, session]);
-      ConnectionManager.post(`${API_URL}/sessions`, session)
-        .catch(err => console.error('Failed to save session:', err));
-    }
-  }, [API_URL]);
-
-  // WebSocket connection for syncing with control page via ConnectionManager
+  // WebSocket connection for syncing with control page via ConnectionManager.
+  // Speaker sessions are recorded by the server when a turn ends (speaker switch
+  // or stop, from any client) and pushed here as 'session' messages, so this
+  // hook only mirrors them; it never writes sessions itself.
   useEffect(() => {
     if (!teamValid || !teamId) return;
 
@@ -147,39 +83,22 @@ export function useStandupTimer(teamId: string) {
       const msg = data as { type: string; [key: string]: unknown };
 
       if (msg.type === 'state') {
-        const prevSpeaker = currentSpeakerRef.current;
-        const newSpeaker = msg.currentSpeaker as TeamMember | null;
-        const speakerChanged = prevSpeaker && newSpeaker && prevSpeaker.id !== newSpeaker.id;
-
-        // If speaker changed remotely (from control page), save previous speaker's session
-        // Skip if we initiated this change locally (already saved in startTimer)
-        if (speakerChanged && startTimeRef.current && standupIdRef.current && !localSpeakerChangeRef.current) {
-          const prevElapsed = Date.now() - startTimeRef.current - totalPausedRef.current;
-          saveSession(
-            prevSpeaker,
-            prevElapsed,
-            interruptionsRef.current,
-            totalPausedRef.current,
-            standupIdRef.current,
-            startTimeRef.current
-          );
-        }
-        // Reset the local change flag after processing
-        localSpeakerChangeRef.current = false;
-
-        // Update all state
-        setCurrentSpeaker(newSpeaker);
+        setCurrentSpeaker(msg.currentSpeaker as TeamMember | null);
         setStatus(msg.status as TimerStatus);
         setElapsedTime(msg.elapsedTime as number);
         setInterruptions(msg.interruptions as number);
-        standupIdRef.current = msg.standupId as string | null;
         setCurrentStandupId(msg.standupId as string | null);
-        startTimeRef.current = msg.startTime as number | null;
-        totalPausedRef.current = msg.totalPaused as number;
-        pauseStartRef.current = msg.pauseStart as number | null;
         setSyncNotes((msg.syncNotes as SyncNote[]) ?? []);
       } else if (msg.type === 'tick') {
         setElapsedTime(msg.elapsedTime as number);
+      } else if (msg.type === 'session') {
+        // A turn was recorded (new session, or more time on an existing one)
+        const session = msg.session as SpeakerSession;
+        setSessions(prev => prev.some(s => s.id === session.id)
+          ? prev.map(s => s.id === session.id ? session : s)
+          : [...prev, session]);
+      } else if (msg.type === 'sessions_cleared') {
+        setSessions([]);
       } else if (msg.type === 'notes') {
         // Sync notes added/removed (possibly by another client)
         setSyncNotes((msg.syncNotes as SyncNote[]) ?? []);
@@ -187,7 +106,6 @@ export function useStandupTimer(teamId: string) {
         // "End Standup" becomes available even before anyone has spoken.
         const noteStandupId = msg.standupId as string | null;
         if (noteStandupId) {
-          standupIdRef.current = noteStandupId;
           setCurrentStandupId(noteStandupId);
         }
       } else if (msg.type === 'end_standup') {
@@ -209,7 +127,7 @@ export function useStandupTimer(teamId: string) {
       unsubscribeMessage();
       // Note: Don't disconnect here - other components may be using the connection
     };
-  }, [teamId, teamValid, saveSession]);
+  }, [teamId, teamValid]);
 
   const wsSend = useCallback((data: object) => {
     ConnectionManager.send(data);
@@ -219,39 +137,14 @@ export function useStandupTimer(teamId: string) {
   // No client-side interval needed - this avoids doubled timer updates
   // when both client and server calculate elapsed time independently.
 
-  // Wrapper that gathers current values from refs and calls saveSession
-  const saveCurrentSession = useCallback(() => {
-    const speaker = currentSpeakerRef.current;
-    const startTime = startTimeRef.current;
-    const standupId = standupIdRef.current;
-    const elapsed = elapsedTimeRef.current;
-
-    if (speaker && startTime && elapsed > 0 && standupId) {
-      saveSession(
-        speaker,
-        elapsed,
-        interruptionsRef.current,
-        totalPausedRef.current,
-        standupId,
-        startTime
-      );
-    }
-  }, [saveSession]);
-
   const startTimer = useCallback((speaker: TeamMember) => {
     // If clicking the current speaker, do nothing
     if (currentSpeaker && currentSpeaker.id === speaker.id) {
       return;
     }
-    // If switching speakers while running, save current session first
-    if (status !== 'idle' && currentSpeaker) {
-      // Mark as local change to prevent double-save when WebSocket state comes back
-      localSpeakerChangeRef.current = true;
-      saveCurrentSession();
-    }
-    // Send to WebSocket server (server manages standupId)
+    // The server closes out (and records) the previous speaker's turn.
     wsSend({ type: 'start', speaker });
-  }, [status, currentSpeaker, saveCurrentSession, wsSend]);
+  }, [currentSpeaker, wsSend]);
 
   const pauseTimer = useCallback(() => {
     wsSend({ type: 'pause' });
@@ -262,9 +155,9 @@ export function useStandupTimer(teamId: string) {
   }, [wsSend]);
 
   const stopTimer = useCallback(() => {
-    saveCurrentSession();
+    // The server records the final speaker's turn before ending the standup.
     wsSend({ type: 'stop' });
-  }, [saveCurrentSession, wsSend]);
+  }, [wsSend]);
 
   const addMember = useCallback((name: string, isGuest = false) => {
     const newMember: TeamMember = { id: crypto.randomUUID(), name, isGuest };
@@ -309,7 +202,8 @@ export function useStandupTimer(teamId: string) {
 
   const clearSessions = useCallback(() => {
     setSessions([]);
-    // Clear from SQLite via ConnectionManager
+    // Clear from SQLite; the server also tells every other open client to drop
+    // its copy (sessions_cleared).
     ConnectionManager.delete(`${API_URL}/sessions`)
       .catch(err => console.error('Failed to clear sessions:', err));
   }, [API_URL]);

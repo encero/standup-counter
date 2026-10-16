@@ -7,6 +7,7 @@
  *   npx tsx scripts/team-cli.ts delete <id>       - Delete a team
  *   npx tsx scripts/team-cli.ts add-member <team_id> <name> - Add member to team
  *   npx tsx scripts/team-cli.ts info <team_id>    - Show team info
+ *   npx tsx scripts/team-cli.ts rotate-id <id>    - Move a team to a new, strong ID
  */
 
 import Database from 'better-sqlite3';
@@ -30,15 +31,37 @@ db.exec(`
 
 const command = process.argv[2];
 
+// The team ID is the access token (it's in every URL), so it must be
+// unguessable: 20 chars from a CSPRNG over [a-z0-9] ≈ 103 bits. Older teams have
+// 8-char IDs; those keep working, and `rotate-id` upgrades them.
+const TEAM_ID_LENGTH = 20;
+
 function generateTeamId(): string {
-  // Generate a readable team ID (8 chars, alphanumeric)
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  // Rejection sampling keeps the distribution uniform (256 isn't a multiple of 36).
+  const limit = 256 - (256 % chars.length);
   let id = '';
-  for (let i = 0; i < 8; i++) {
-    id += chars[Math.floor(Math.random() * chars.length)];
+  while (id.length < TEAM_ID_LENGTH) {
+    for (const byte of randomBytes(TEAM_ID_LENGTH * 2)) {
+      if (byte < limit && id.length < TEAM_ID_LENGTH) id += chars[byte % chars.length];
+    }
   }
   return id;
 }
+
+function tableExists(name: string): boolean {
+  return Boolean(db.prepare("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?").get(name));
+}
+
+// Every table holding per-team rows, with its team column.
+const TEAM_TABLES: Array<[table: string, column: string]> = [
+  ['sessions', 'team_id'],
+  ['standups', 'team_id'],
+  ['team_members', 'team_id'],
+  ['sync_notes', 'team_id'],
+  ['sprint_goals', 'team_id'],
+  ['pr_status', 'team_id'],
+];
 
 function createTeam(name: string) {
   const id = generateTeamId();
@@ -84,10 +107,12 @@ function deleteTeam(id: string) {
   }
 
   // Delete all related data
-  db.prepare('DELETE FROM sessions WHERE team_id = ?').run(id);
-  db.prepare('DELETE FROM standups WHERE team_id = ?').run(id);
-  db.prepare('DELETE FROM team_members WHERE team_id = ?').run(id);
-  db.prepare('DELETE FROM teams WHERE id = ?').run(id);
+  db.transaction(() => {
+    for (const [table, column] of TEAM_TABLES) {
+      if (tableExists(table)) db.prepare(`DELETE FROM ${table} WHERE ${column} = ?`).run(id);
+    }
+    db.prepare('DELETE FROM teams WHERE id = ?').run(id);
+  })();
 
   console.log(`\n✅ Deleted team "${team.name}" and all its data\n`);
 }
@@ -180,6 +205,31 @@ function generatePrToken(teamId: string) {
   console.log(`     npm run publish-prs -- --repo owner/name --team ${teamId} --app http://localhost:3001 --authors alice,bob\n`);
 }
 
+// Move a team (and all of its data) to a fresh, strong ID. Use this for teams
+// created with the old 8-character IDs, or if a team URL has leaked. The old
+// URLs stop working immediately; open timer pages must be reopened on the new URL.
+function rotateTeamId(oldId: string) {
+  const team = db.prepare('SELECT name FROM teams WHERE id = ?').get(oldId) as { name: string } | undefined;
+  if (!team) {
+    console.error(`\n❌ Team not found: ${oldId}\n`);
+    process.exit(1);
+  }
+
+  const newId = generateTeamId();
+  db.transaction(() => {
+    db.prepare('UPDATE teams SET id = ? WHERE id = ?').run(newId, oldId);
+    for (const [table, column] of TEAM_TABLES) {
+      if (tableExists(table)) db.prepare(`UPDATE ${table} SET ${column} = ? WHERE ${column} = ?`).run(newId, oldId);
+    }
+  })();
+
+  console.log(`\n✅ Team "${team.name}" moved to a new ID\n`);
+  console.log(`   Old ID: ${oldId}  (no longer works)`);
+  console.log(`   New ID: ${newId}`);
+  console.log(`\n⚠️  Restart the server (it caches live timer state by team ID), update`);
+  console.log(`   bookmarks/displays, and re-point any PR publisher at the new --team.\n`);
+}
+
 // Command router
 switch (command) {
   case 'create': {
@@ -240,6 +290,15 @@ switch (command) {
     generatePrToken(tokenTeamId);
     break;
   }
+  case 'rotate-id': {
+    const rotateId = process.argv[3];
+    if (!rotateId) {
+      console.error('Usage: team rotate-id <team_id>');
+      process.exit(1);
+    }
+    rotateTeamId(rotateId);
+    break;
+  }
   default:
     console.log(`
 Team Management CLI
@@ -252,6 +311,7 @@ Commands:
   info <team_id>               Show team details
   migrate <team_id>            Migrate orphaned data to a team
   pr-token <team_id>           Generate/rotate the PR publisher ingest token
+  rotate-id <team_id>          Move a team to a new, strong ID (old URLs stop working)
 
 Examples:
   npm run team create "Engineering"

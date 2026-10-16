@@ -510,3 +510,133 @@ test.describe('Sprint Rollover on Standup Start', () => {
     ws.close();
   });
 });
+
+test.describe('Server-side Session Recording', () => {
+  function sessionsFor(teamId: string) {
+    const db = new Database(TEST_DB_PATH);
+    const rows = db.prepare(
+      'SELECT member_name as memberName, duration, paused_duration as pausedDuration, interruptions FROM sessions WHERE team_id = ?'
+    ).all(teamId) as Array<{ memberName: string; duration: number; pausedDuration: number; interruptions: number }>;
+    db.close();
+    return rows;
+  }
+
+  test('stop records the final speaker even when no timer page is open', async () => {
+    // e.g. a standup run and ended entirely from the phone control page
+    const teamId = createTeamInDb('Control Only Team');
+    const { ws } = await connectWebSocket(teamId);
+
+    await sendAndWaitForState(ws, { type: 'start', speaker: { id: crypto.randomUUID(), name: 'Olive' } });
+    await new Promise(r => setTimeout(r, 300));
+
+    const sessionPromise = waitForMessage(ws, 'session');
+    ws.send(JSON.stringify({ type: 'stop' }));
+    const { session } = await sessionPromise as unknown as { session: { memberName: string; duration: number } };
+    expect(session.memberName).toBe('Olive');
+
+    const rows = sessionsFor(teamId);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].duration).toBeGreaterThanOrEqual(250);
+
+    ws.close();
+  });
+
+  test('a turn is recorded once no matter how many clients are connected', async () => {
+    const teamId = createTeamInDb('Many Clients Team');
+    const { ws: a } = await connectWebSocket(teamId);
+    const { ws: b } = await connectWebSocket(teamId);
+    const { ws: c } = await connectWebSocket(teamId);
+
+    await sendAndWaitForState(a, { type: 'start', speaker: { id: crypto.randomUUID(), name: 'Pia' } });
+    await new Promise(r => setTimeout(r, 200));
+    await sendAndWaitForState(b, { type: 'start', speaker: { id: crypto.randomUUID(), name: 'Quinn' } });
+    await sendAndWaitForState(c, { type: 'stop' });
+
+    const rows = sessionsFor(teamId);
+    expect(rows.filter(r => r.memberName === 'Pia')).toHaveLength(1);
+    expect(rows.filter(r => r.memberName === 'Quinn')).toHaveLength(1);
+
+    a.close(); b.close(); c.close();
+  });
+
+  test('switching speaker while paused does not count the pause as speaking time', async () => {
+    const teamId = createTeamInDb('Paused Switch Team');
+    const { ws } = await connectWebSocket(teamId);
+
+    await sendAndWaitForState(ws, { type: 'start', speaker: { id: crypto.randomUUID(), name: 'Rae' } });
+    await new Promise(r => setTimeout(r, 200));
+    await sendAndWaitForState(ws, { type: 'pause' });
+    await new Promise(r => setTimeout(r, 1000));
+    await sendAndWaitForState(ws, { type: 'start', speaker: { id: crypto.randomUUID(), name: 'Sam' } });
+
+    const rae = sessionsFor(teamId).find(r => r.memberName === 'Rae')!;
+    expect(rae.duration).toBeLessThan(800);
+    expect(rae.pausedDuration).toBeGreaterThanOrEqual(900);
+    expect(rae.interruptions).toBe(1);
+
+    ws.close();
+  });
+
+  test('speakers talking twice accumulate into one session', async () => {
+    const teamId = createTeamInDb('Twice Team');
+    const { ws } = await connectWebSocket(teamId);
+    const tia = { id: crypto.randomUUID(), name: 'Tia' };
+
+    await sendAndWaitForState(ws, { type: 'start', speaker: tia });
+    await new Promise(r => setTimeout(r, 200));
+    await sendAndWaitForState(ws, { type: 'start', speaker: { id: crypto.randomUUID(), name: 'Uma' } });
+    await sendAndWaitForState(ws, { type: 'start', speaker: tia });
+    await new Promise(r => setTimeout(r, 200));
+    await sendAndWaitForState(ws, { type: 'stop' });
+
+    const tiaRows = sessionsFor(teamId).filter(r => r.memberName === 'Tia');
+    expect(tiaRows).toHaveLength(1);
+    expect(tiaRows[0].duration).toBeGreaterThanOrEqual(350);
+
+    ws.close();
+  });
+});
+
+test.describe('WebSocket Hardening', () => {
+  test('speaker payload is reduced to known fields', async () => {
+    const teamId = createTeamInDb('Sanitize Team');
+    const { ws } = await connectWebSocket(teamId);
+
+    const state = await sendAndWaitForState(ws, {
+      type: 'start',
+      speaker: { id: crypto.randomUUID(), name: 'Vic', junk: 'x'.repeat(1000), nested: { a: 1 } },
+    });
+    expect(Object.keys(state.currentSpeaker as object).sort()).toEqual(['id', 'name']);
+
+    ws.close();
+  });
+
+  test('oversized messages are refused', async () => {
+    const teamId = createTeamInDb('Big Message Team');
+    const { ws } = await connectWebSocket(teamId);
+
+    const code = await new Promise<number>((resolve) => {
+      ws.on('close', (c) => resolve(c));
+      ws.send(JSON.stringify({ type: 'add_note', text: 'x'.repeat(100 * 1024) }));
+    });
+    expect(code).toBe(1009); // Message Too Big
+
+    // The server is still healthy for other clients.
+    const { ws: other } = await connectWebSocket(teamId);
+    other.close();
+  });
+
+  test('connections from foreign origins are rejected', async () => {
+    const teamId = createTeamInDb('Origin Team');
+    const ws = new WebSocket(`${WS_BASE}/ws/${teamId}`, { origin: 'https://evil.example.com' });
+
+    const outcome = await new Promise<string>((resolve) => {
+      ws.on('open', () => resolve('open'));
+      ws.on('error', () => resolve('rejected'));
+      ws.on('unexpected-response', () => resolve('rejected'));
+      setTimeout(() => resolve('timeout'), 3000);
+    });
+    expect(outcome).toBe('rejected');
+    ws.terminate();
+  });
+});

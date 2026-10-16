@@ -108,19 +108,42 @@ export function Settings({
 
   // Generate/rotate the publisher ingest token. The server returns the raw
   // token once; any previously issued token stops working immediately.
+  // Rotating an existing token requires the current one, so someone who merely
+  // has the team URL can't hijack the publisher feed. A lost token is reset on
+  // the server with `npm run team pr-token <teamId>`.
   const handleResetToken = () => {
-    if (prTokenConfigured && !window.confirm('Reset the publisher token? The current token will stop working and the publisher must be reconfigured.')) {
-      return;
+    let currentToken: string | null = null;
+    if (prTokenConfigured) {
+      currentToken = window.prompt(
+        'Reset the publisher token? The current token will stop working and the publisher must be reconfigured.\n\n'
+        + 'Paste the current token to confirm (lost it? run `npm run team pr-token ' + teamId + '` on the server):'
+      );
+      if (!currentToken?.trim()) return;
     }
     setPrTokenBusy(true);
-    ConnectionManager.post<{ token: string }>(`/api/${teamId}/pr-status/token`)
+    ConnectionManager.fetch<{ token: string }>(`/api/${teamId}/pr-status/token`, {
+      method: 'POST',
+      headers: currentToken ? { Authorization: `Bearer ${currentToken.trim()}` } : undefined,
+    })
       .then(({ token }) => {
         setPrToken(token);
         setPrTokenConfigured(true);
         setPrTokenCopied(false);
       })
-      .catch(console.error)
+      .catch((err: Error & { status?: number }) => {
+        if (err.status === 401) {
+          window.alert('That token does not match the current one. Nothing was changed.');
+        } else {
+          console.error(err);
+        }
+      })
       .finally(() => setPrTokenBusy(false));
+  };
+
+  const handleClearSessions = () => {
+    if (window.confirm('Delete ALL recorded standups and speaker history for this team? This cannot be undone.')) {
+      onClearSessions();
+    }
   };
 
   const handleCopyToken = () => {
@@ -172,7 +195,11 @@ export function Settings({
           <DialogDescription>Configure your standup timer</DialogDescription>
         </DialogHeader>
 
-        <div className="space-y-6 py-4">
+        {/* min-w-0: DialogContent is a CSS grid, and a grid item's default
+            min-width is its min-content width. The truncated (nowrap) past-goal
+            rows would otherwise stretch the column to the full goal text and
+            make the whole dialog scroll sideways. */}
+        <div className="min-w-0 space-y-6 py-4">
           {/* Expected Time */}
           <div className="space-y-2">
             <label className="text-sm font-medium">Expected time per speaker</label>
@@ -230,7 +257,7 @@ export function Settings({
               </div>
               <div className="space-y-1">
                 <label className="text-xs text-muted-foreground">Length</label>
-                <div className="flex items-center gap-1.5">
+                <div className="flex flex-wrap items-center gap-1.5">
                   {[
                     [7, '1w'],
                     [14, '2w'],
@@ -391,7 +418,7 @@ export function Settings({
             <Button
               variant="destructive"
               className="w-full gap-2"
-              onClick={onClearSessions}
+              onClick={handleClearSessions}
             >
               <Trash2 className="h-4 w-4" />
               Clear All Sessions

@@ -428,8 +428,13 @@ test.describe('PR Status API', () => {
     return { status: response.status, data: await response.json().catch(() => null) };
   }
 
-  async function mintToken(teamId: string): Promise<string> {
-    const { data } = await api('POST', `/api/${teamId}/pr-status/token`);
+  // Mint the first token, or rotate by presenting the current one.
+  async function mintToken(teamId: string, current?: string): Promise<string> {
+    const response = await fetch(`${BASE_URL}/api/${teamId}/pr-status/token`, {
+      method: 'POST',
+      headers: current ? { Authorization: `Bearer ${current}` } : {},
+    });
+    const data = await response.json();
     return data.token as string;
   }
 
@@ -502,11 +507,28 @@ test.describe('PR Status API', () => {
   test('rotating the token invalidates the previous one', async () => {
     const teamId = createTeamInDb('PR Team');
     const first = await mintToken(teamId);
-    const second = await mintToken(teamId);
+    const second = await mintToken(teamId, first);
     expect(second).not.toBe(first);
 
     expect((await ingest(teamId, first, { prs: [] })).status).toBe(401);
     expect((await ingest(teamId, second, { prs: [] })).status).toBe(200);
+  });
+
+  test('rotating an existing token requires presenting the current one', async () => {
+    const teamId = createTeamInDb('PR Team');
+    const token = await mintToken(teamId);
+
+    // Knowing only the team URL is not enough to hijack the publisher feed.
+    const anonymous = await api('POST', `/api/${teamId}/pr-status/token`);
+    expect(anonymous.status).toBe(401);
+    const wrong = await fetch(`${BASE_URL}/api/${teamId}/pr-status/token`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${'deadbeef'.repeat(6)}` },
+    });
+    expect(wrong.status).toBe(401);
+
+    // The original token still works.
+    expect((await ingest(teamId, token, { prs: [] })).status).toBe(200);
   });
 
   test('ingest strips extra fields and drops malformed entries', async () => {
@@ -618,5 +640,119 @@ test.describe('Trends API', () => {
     // 1-day trends should return less or equal data
     const { data: oneDay } = await api('GET', `/api/${teamId}/trends/team?days=1`);
     expect(oneDay.overall.standupCount).toBeLessThanOrEqual(sevenDays.overall.standupCount);
+  });
+});
+
+test.describe('Input Validation', () => {
+  test('POST members rejects a missing name and generates an id when omitted', async () => {
+    const teamId = createTeamInDb('Validation Team');
+
+    expect((await api('POST', `/api/${teamId}/members`, { id: crypto.randomUUID() })).status).toBe(400);
+    expect((await api('POST', `/api/${teamId}/members`, { name: { evil: true } })).status).toBe(400);
+
+    const { status, data } = await api('POST', `/api/${teamId}/members`, { name: '  Zed  ' });
+    expect(status).toBe(200);
+    expect(data.name).toBe('Zed');
+    expect(typeof data.id).toBe('string');
+  });
+
+  test('POST sessions rejects non-numeric durations', async () => {
+    const teamId = createTeamInDb('Validation Team');
+    const { status } = await api('POST', `/api/${teamId}/sessions`, {
+      id: crypto.randomUUID(), memberId: crypto.randomUUID(), memberName: 'A',
+      standupId: crypto.randomUUID(), startTime: Date.now(), endTime: Date.now(),
+      duration: 'lots', interruptions: 0, pausedDuration: 0,
+    });
+    expect(status).toBe(400);
+  });
+
+  test('PUT settings rejects a bad expectedSeconds and normalizes stock symbols', async () => {
+    const teamId = createTeamInDb('Validation Team');
+
+    expect((await api('PUT', `/api/${teamId}/settings`, { expectedSeconds: 'abc' })).status).toBe(400);
+    expect((await api('PUT', `/api/${teamId}/settings`, { expectedSeconds: -5 })).status).toBe(400);
+
+    await api('PUT', `/api/${teamId}/settings`, { stockSymbols: 'aapl, ../../v7/x?y=1 ,msft,AAPL' });
+    const { data } = await api('GET', `/api/${teamId}/settings`);
+    expect(data.stockSymbols).toBe('AAPL,MSFT');
+  });
+
+  test('PUT sprint rejects a start date that is not a real calendar date', async () => {
+    const teamId = createTeamInDb('Validation Team');
+    const { status } = await api('PUT', `/api/${teamId}/sprint`, { startDate: '2025-13-45', lengthDays: 14 });
+    expect(status).toBe(400);
+  });
+
+  test('re-anchoring the sprint cadence keeps the current goal', async () => {
+    const teamId = createTeamInDb('Cadence Team');
+    const iso = (n: number) => {
+      const d = new Date();
+      d.setDate(d.getDate() - n);
+      return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    };
+    await api('PUT', `/api/${teamId}/sprint`, { goal: 'Keep me', startDate: iso(3), lengthDays: 14 });
+
+    const { data } = await api('PUT', `/api/${teamId}/sprint`, { startDate: iso(1) });
+    expect(data.windowStart).toBe(iso(1));
+    expect(data.goal).toBe('Keep me');
+  });
+});
+
+test.describe('Tenant Isolation', () => {
+  test("a team cannot overwrite another team's standup record", async () => {
+    const victim = createTeamInDb('Victim Team');
+    const attacker = createTeamInDb('Attacker Team');
+    const standupId = crypto.randomUUID();
+    const victimMember = (await api('POST', `/api/${victim}/members`, { name: 'V' })).data.id;
+    const attackerMember = (await api('POST', `/api/${attacker}/members`, { name: 'A' })).data.id;
+    const session = (memberId: string, duration: number) => ({
+      id: crypto.randomUUID(), memberId, memberName: 'X', standupId,
+      startTime: Date.now() - 60000, endTime: Date.now(), duration, interruptions: 0, pausedDuration: 0,
+    });
+
+    expect((await api('POST', `/api/${victim}/sessions`, session(victimMember, 1000))).status).toBe(200);
+    expect((await api('POST', `/api/${attacker}/sessions`, session(attackerMember, 999999))).status).toBe(200);
+
+    const { data: victimStandups } = await api('GET', `/api/${victim}/trends/standups`);
+    expect(victimStandups).toHaveLength(1);
+    expect(victimStandups[0].totalDuration).toBe(1000);
+    const { data: attackerStandups } = await api('GET', `/api/${attacker}/trends/standups`);
+    expect(attackerStandups).toHaveLength(0);
+  });
+
+  test('clearing sessions also removes notes of finished standups', async () => {
+    const teamId = createTeamInDb('Clear Team');
+    const db = new Database(TEST_DB_PATH);
+    db.prepare('INSERT INTO sync_notes (id, team_id, standup_id, text, created_at) VALUES (?, ?, ?, ?, ?)')
+      .run(crypto.randomUUID(), teamId, 'old-standup', 'stale', Date.now());
+    db.close();
+
+    await api('DELETE', `/api/${teamId}/sessions`);
+    const { data } = await api('GET', `/api/${teamId}/notes?standupId=old-standup`);
+    expect(data).toEqual([]);
+  });
+});
+
+test.describe('HTTP Hardening', () => {
+  test('responses carry security headers', async () => {
+    const response = await fetch(`${BASE_URL}/api/version`);
+    expect(response.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+    expect(response.headers.get('content-security-policy')).toContain("frame-ancestors 'self'");
+    expect(response.headers.get('x-powered-by')).toBeNull();
+  });
+
+  test('cross-origin requests from other sites are not allowed', async () => {
+    const teamId = createTeamInDb('CORS Team');
+    const response = await fetch(`${BASE_URL}/api/${teamId}/members`, {
+      headers: { Origin: 'https://evil.example.com' },
+    });
+    expect(response.headers.get('access-control-allow-origin')).toBeNull();
+  });
+
+  test('healthz responds without exposing details', async () => {
+    const { status, data } = await api('GET', '/healthz');
+    expect(status).toBe(200);
+    expect(data).toEqual({ ok: true });
   });
 });

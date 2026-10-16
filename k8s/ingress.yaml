@@ -4,10 +4,13 @@ metadata:
   name: standup-counter
   namespace: standup-counter
   annotations:
-    traefik.ingress.kubernetes.io/router.entrypoints: web,websecure
-    # Enable WebSocket support
-    traefik.ingress.kubernetes.io/service.sticky.cookie: "true"
-    traefik.ingress.kubernetes.io/service.sticky.cookie.name: standup-session
+    # HTTPS only: the team ID in every URL is the access token, and the PR
+    # publisher sends a bearer token, so neither may cross the network in clear
+    # text. Redirect plain HTTP to HTTPS at the Traefik "web" entrypoint (e.g.
+    # entryPoints.web.http.redirections) rather than serving the app on it.
+    # Traefik proxies WebSockets natively; no extra annotation is needed.
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
 spec:
   ingressClassName: traefik
   rules:
@@ -21,8 +24,9 @@ spec:
                 name: standup-counter
                 port:
                   number: 80
-  # Uncomment for TLS
-  # tls:
-  #   - hosts:
-  #       - standup.example.com
-  #     secretName: standup-tls
+  tls:
+    - hosts:
+        - standup.example.com  # Change to your domain
+      # Certificate secret (e.g. issued by cert-manager). If it doesn't exist,
+      # Traefik falls back to its default certificate.
+      secretName: standup-tls
