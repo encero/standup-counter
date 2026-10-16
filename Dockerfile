@@ -12,6 +12,10 @@ ENV APP_VERSION=$APP_VERSION
 # Copy package files
 COPY package*.json ./
 
+# Use the npm version pinned in package.json "packageManager"; Node 22's bundled
+# npm 10 rejects lockfiles written by npm 11 (optional @emnapi/* peer entries).
+RUN npm install -g "$(node -p 'require("./package.json").packageManager')"
+
 # Install dependencies
 RUN npm ci
 
@@ -37,6 +41,9 @@ RUN apk add --no-cache python3 make g++ sqlite tzdata su-exec
 
 # Copy package files for production deps only
 COPY package*.json ./
+
+# Same pinned npm as the build stage (see above)
+RUN npm install -g "$(node -p 'require("./package.json").packageManager')"
 
 # Install production dependencies only
 RUN npm ci --omit=dev

@@ -31,12 +31,19 @@ jobs:
         with:
           node-version: '22'
 
+      # Node 22 bundles npm 10, which disagrees with npm 11 about lockfile
+      # entries for optional peer deps (@emnapi/* via @napi-rs/wasm-runtime).
+      # Use the npm version pinned in package.json "packageManager" so CI, Docker
+      # and local installs all read and write the lockfile the same way.
+      - name: Use pinned npm version
+        run: npm install -g "$(node -p 'require("./package.json").packageManager')"
+
       - name: Validate package-lock.json is in sync
         run: |
           npm ci --ignore-scripts
           git diff --exit-code package-lock.json || {
             echo "::error::package-lock.json is out of sync with package.json"
-            echo "Run 'npm install' locally and commit the updated package-lock.json"
+            echo "Run 'npm install' locally with npm $(npm -v) and commit the updated package-lock.json"
             exit 1
           }
 
